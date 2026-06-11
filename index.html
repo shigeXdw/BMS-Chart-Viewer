@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>B62 BMS Player</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="https://github.com/shigeXdw" target="_blank" rel="noopener noreferrer" title="Visit shigeXdw on GitHub">
+      <img class="brand-mark" src="shigexdw-logo.png" alt="shigeXdw">
+      <div>
+        <strong>BMS Player</strong>
+        <small>by shigeXdw</small>
+      </div>
+    </a>
+    <div class="transport">
+      <button id="openButton" class="command">Open folder</button>
+      <select id="chartSelect" aria-label="Chart" disabled>
+        <option>No chart loaded</option>
+      </select>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="playfield-panel">
+      <canvas id="playfield"></canvas>
+      <div id="judgement" class="judgement">
+        <strong id="judgeText">0000 / 0000</strong>
+      </div>
+      <section class="live-stats" aria-label="Live statistics">
+        <div>
+          <span>KPS</span>
+          <strong id="currentKps">0.0</strong>
+        </div>
+        <div>
+          <span>Peak KPS</span>
+          <strong id="peakKps">0.0</strong>
+        </div>
+        <div>
+          <span>Density</span>
+          <strong id="density">0</strong>
+          <small>next 4 measures</small>
+        </div>
+      </section>
+      <div class="seekbar">
+        <button id="backButton" title="Back 10 seconds" disabled>-10</button>
+        <button id="playButton" class="timeline-button" title="Play or pause" disabled>&#9654;</button>
+        <input id="seekInput" type="range" min="0" max="1000" value="0" step="1" aria-label="Playback position" disabled>
+        <button id="forwardButton" title="Forward 10 seconds" disabled>+10</button>
+        <button id="stopButton" class="timeline-button" title="Reset" disabled>&#8634;</button>
+      </div>
+    </section>
+
+    <aside class="side-panel">
+      <div class="movie-stage">
+        <video id="bga" muted playsinline></video>
+        <div id="moviePlaceholder">NO BGA</div>
+      </div>
+
+      <section class="song-info">
+        <div class="title-row">
+          <div>
+            <span id="genre">BMS</span>
+            <h1 id="title">Choose a folder</h1>
+            <p id="artist">Local files stay on your device</p>
+          </div>
+          <span id="difficulty" class="difficulty">--</span>
+        </div>
+
+        <dl class="stats">
+          <div><dt>BPM</dt><dd id="bpm">--</dd></div>
+          <div><dt>Notes</dt><dd id="notes">--</dd></div>
+          <div><dt>Time</dt><dd id="time">00:00 / 00:00</dd></div>
+          <div><dt>Base</dt><dd id="base">36</dd></div>
+        </dl>
+      </section>
+
+      <section class="settings">
+        <div class="setting-group">
+          <h2>Scroll</h2>
+          <label>
+            <span>Mode</span>
+            <select id="scrollMode" aria-label="Scroll mode">
+              <option value="iidx" selected>IIDX Hi-Speed</option>
+              <option value="fixed">Fixed px/sec</option>
+            </select>
+            <output id="scrollModeValue">--</output>
+          </label>
+          <label>
+            <span id="speedLabel">Hi-Speed</span>
+            <input id="speed" type="range" min="300" max="1300" value="720" step="20">
+            <output id="speedValue">2.50x</output>
+          </label>
+        </div>
+
+        <div class="setting-group">
+          <h2>Playfield</h2>
+          <div class="mod-control">
+            <span>Lane mod</span>
+            <div class="mod-buttons" role="group" aria-label="Lane modifier">
+              <button type="button" class="mod-button active" data-mod="normal">Normal</button>
+              <button type="button" class="mod-button" data-mod="mirror">Mirror</button>
+              <button type="button" class="mod-button" data-mod="random">Random</button>
+              <button type="button" class="mod-button" data-mod="rrandom">R-Random</button>
+              <button type="button" class="mod-button" data-mod="srandom">S-Random</button>
+            </div>
+          </div>
+          <div id="laneArrangement" class="lane-arrangement">
+            <span>1P</span>
+            <output id="laneArrangement1">1 2 3 4 5 6 7</output>
+            <span id="laneArrangement2Label" hidden>2P</span>
+            <output id="laneArrangement2" hidden>1 2 3 4 5 6 7</output>
+          </div>
+          <div class="sudden-control">
+            <button id="suddenButton" type="button" class="option-button" aria-pressed="false">SUDDEN+</button>
+            <input id="suddenAmount" type="range" min="5" max="80" value="35" step="1" disabled>
+            <output id="suddenAmountValue">35%</output>
+          </div>
+          <label>
+            <span>Columns</span>
+            <input id="columnWidth" type="range" min="70" max="150" value="80" step="5" autocomplete="off">
+            <output id="columnWidthValue">80%</output>
+          </label>
+          <label>
+            <span>Scratch</span>
+            <input id="scratchWidth" type="range" min="110" max="220" value="155" step="5" autocomplete="off">
+            <output id="scratchWidthValue">155%</output>
+          </label>
+          <label>
+            <span>Note thickness</span>
+            <input id="noteThickness" type="range" min="4" max="18" value="8" step="1">
+            <output id="noteThicknessValue">8px</output>
+          </label>
+          <label class="switch-row">
+            <span>Hit effects</span>
+            <input id="hitEffects" type="checkbox" checked>
+            <i aria-hidden="true"></i>
+          </label>
+        </div>
+
+        <div class="setting-group">
+          <h2>Playback</h2>
+          <label class="speed-row">
+            <span>Song speed</span>
+            <input id="songSpeed" type="range" min="50" max="200" value="100" step="5" autocomplete="off">
+            <output id="songSpeedValue">100%</output>
+          </label>
+          <label>
+            <span>Volume</span>
+            <input id="volume" type="range" min="0" max="1" value="0.8" step="0.05">
+            <output id="volumeValue">80%</output>
+          </label>
+          <div class="switches">
+            <label class="switch-row">
+              <span>Pitch with speed</span>
+              <input id="pitchWithSpeed" type="checkbox">
+              <i aria-hidden="true"></i>
+            </label>
+            <label class="switch-row">
+              <span>Keysounds</span>
+              <input id="keysounds" type="checkbox" checked>
+              <i aria-hidden="true"></i>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <div id="status" class="status">Choose a song folder containing BME/BMS and WAV files.</div>
+    </aside>
+  </main>
+
+  <input id="folderInput" type="file" webkitdirectory multiple hidden>
+  <script src="app.js"></script>
+</body>
+</html>
