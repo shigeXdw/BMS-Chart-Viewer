@@ -5,7 +5,7 @@ are read locally and never uploaded.
 
 ## Live Player
 
-[Open BMS Player](https://shigexdw.github.io/bms-player/)
+[Open BMS Player](https://shigexdw.github.io/BMS-Chart-Viewer/)
 
 ## Usage
 
