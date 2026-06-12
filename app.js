@@ -980,7 +980,7 @@
 
     for (let lane = 0; lane < lanes; lane++) {
       const column = geometry[lane];
-      ctx.fillStyle = column.scratch ? "#171d25" : (lane % 2 ? "#0e1115" : "#171a1e");
+      ctx.fillStyle = column.scratch ? "#15120e" : (lane % 2 ? "#171a1e" : "#0e1115 ");
       ctx.fillRect(column.x, 0, column.width, height);
       ctx.strokeStyle = lane === 8 ? "#dce4e9" : "#3d454d";
       ctx.beginPath(); ctx.moveTo(column.x, 0); ctx.lineTo(column.x, height); ctx.stroke();
