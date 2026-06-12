@@ -3,6 +3,10 @@
 A dependency-free browser player for previewing BMS and BME charts. Song files
 are read locally and never uploaded.
 
+## Live Player
+
+[Open BMS Player](https://shigexdw.github.io/bms-player/)
+
 ## Usage
 
 Open `index.html` in Chrome or Edge, select **Open folder**, and choose the
