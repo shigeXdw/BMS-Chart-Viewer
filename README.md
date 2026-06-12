@@ -17,11 +17,6 @@ are read locally and never uploaded
 - SUDDEN+, IIDX-style Hi-Speed, playback speed, and pitch controls
 - KPS, peak KPS, density, and note progress statistics
 
-## GitHub Pages
-
-The project is static and can be hosted directly with GitHub Pages. Publish the
-repository root from the `main` branch; no build step or server is required
-
 ## Limitations
 
 This is an autoplay preview. BMSON parsing is currently not included
