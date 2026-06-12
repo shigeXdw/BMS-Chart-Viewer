@@ -1,6 +1,6 @@
 # BMS Player
 
-A dependency-free browser player for previewing BMS and BME charts, Song files
+A dependency-free browser player for previewing BMS, BME and BMSON charts, Song files
 are read locally and never uploaded
 
 ## Live Player
@@ -19,4 +19,4 @@ are read locally and never uploaded
 
 ## Limitations
 
-This is an autoplay preview. BMSON parsing is currently not included
+This is an autoplay preview
