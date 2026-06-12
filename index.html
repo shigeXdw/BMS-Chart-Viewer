@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>B62 BMS Player</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=14">
 </head>
 <body>
   <header class="topbar">
@@ -15,7 +15,12 @@
         <small>by shigeXdw</small>
       </div>
     </a>
+    <nav class="view-tabs" aria-label="Application view">
+      <button class="view-tab active" type="button" data-view="player" aria-selected="true">Player</button>
+      <button class="view-tab" type="button" data-view="inspector" aria-selected="false">Chart Inspector</button>
+    </nav>
     <div class="transport">
+      <button id="themeButton" class="icon-button" type="button" title="Switch theme" aria-label="Switch theme">☀</button>
       <button id="openButton" class="command">Open folder</button>
       <select id="chartSelect" aria-label="Chart" disabled>
         <option>No chart loaded</option>
@@ -23,7 +28,7 @@
     </div>
   </header>
 
-  <main class="workspace">
+  <main id="playerView" class="workspace app-view">
     <section class="playfield-panel">
       <canvas id="playfield"></canvas>
       <div id="judgement" class="judgement">
@@ -41,7 +46,7 @@
         <div>
           <span>Density</span>
           <strong id="density">0</strong>
-          <small>next 4 measures</small>
+          <small>notes/sec, next 4s</small>
         </div>
       </section>
       <div class="seekbar">
@@ -55,7 +60,9 @@
 
     <aside class="side-panel">
       <div class="movie-stage">
+        <canvas id="bgaCanvas"></canvas>
         <video id="bga" muted playsinline></video>
+        <video id="bgaLayerVideo" muted playsinline></video>
         <div id="moviePlaceholder">NO BGA</div>
       </div>
 
@@ -90,8 +97,8 @@
           </label>
           <label>
             <span id="speedLabel">Hi-Speed</span>
-            <input id="speed" type="range" min="50" max="1000" value="200" step="1">
-            <output id="speedValue">2.00x</output>
+            <input id="speed" type="range" min="1" max="1999" value="200" step="1">
+            <input id="speedValue" class="number-value" type="number" min="0.01" max="19.99" value="2.00" step="0.01" aria-label="Hi-Speed value">
           </label>
         </div>
 
@@ -145,7 +152,7 @@
           <label class="speed-row">
             <span>Song speed</span>
             <input id="songSpeed" type="range" min="50" max="200" value="100" step="5" autocomplete="off">
-            <output id="songSpeedValue">100%</output>
+            <input id="songSpeedValue" class="number-value" type="number" min="50" max="200" value="100" step="1" aria-label="Song speed percentage">
           </label>
           <label>
             <span>Volume</span>
@@ -167,11 +174,71 @@
         </div>
       </section>
 
-      <div id="status" class="status">Choose a song folder containing BME/BMS and WAV files.</div>
+      <div id="status" class="status">Choose a song folder containing BMS, BME, or BMSON files.</div>
     </aside>
   </main>
 
+  <main id="inspectorView" class="inspector app-view" hidden>
+    <header class="inspector-header">
+      <div>
+        <span class="eyebrow">Chart analysis</span>
+        <h1 id="inspectorTitle">Load a chart to inspect it</h1>
+        <p id="inspectorSubtitle">Measures, timing, chords, density, BPM changes, and lane distribution</p>
+      </div>
+      <div class="inspector-actions">
+        <div class="inspector-mod-control">
+          <span>Lane mod</span>
+          <div class="inspector-mods" role="group" aria-label="Inspector lane modifier">
+            <button type="button" class="mod-button active" data-mod="normal">Normal</button>
+            <button type="button" class="mod-button" data-mod="mirror">Mirror</button>
+            <button type="button" class="mod-button" data-mod="random">Random</button>
+            <button type="button" class="mod-button" data-mod="rrandom">R-Random</button>
+            <button type="button" class="mod-button" data-mod="srandom">S-Random</button>
+          </div>
+        </div>
+        <label>
+          <span>Measures per column</span>
+          <select id="inspectorColumnSize">
+            <option value="2">2</option>
+            <option value="4" selected>4</option>
+            <option value="8">8</option>
+          </select>
+        </label>
+        <button id="inspectorCurrentButton" type="button">Jump to current</button>
+      </div>
+    </header>
+    <section class="analysis-strip" aria-label="Chart summary">
+      <div><span>Notes</span><strong id="analysisNotes">0</strong></div>
+      <div><span>Peak NPS</span><strong id="analysisPeak">0.0</strong></div>
+      <div><span>Max chord</span><strong id="analysisChord">0</strong></div>
+      <div><span>Scratch</span><strong id="analysisScratch">0</strong></div>
+      <div><span>Long notes</span><strong id="analysisLong">0</strong></div>
+      <div><span>BPM range</span><strong id="analysisBpm">--</strong></div>
+    </section>
+    <section class="inspector-body">
+      <aside class="analysis-panel">
+        <h2>Lane distribution</h2>
+        <div id="laneDistribution" class="lane-distribution"></div>
+        <h2>Density timeline</h2>
+        <canvas id="densityGraph" width="320" height="150"></canvas>
+        <h2>Notes radar</h2>
+        <canvas id="notesRadar" width="320" height="270"></canvas>
+        <div class="analysis-legend">
+          <span><i class="legend-note"></i>Key</span>
+          <span><i class="legend-scratch"></i>Scratch</span>
+          <span><i class="legend-ln"></i>Long note</span>
+          <span><i class="legend-bpm"></i>BPM event</span>
+        </div>
+      </aside>
+      <div id="inspectorScroller" class="inspector-scroller">
+        <div id="measureGrid" class="measure-grid">
+          <p class="inspector-empty">Choose a song folder to build the chart overview.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
   <input id="folderInput" type="file" webkitdirectory multiple hidden>
-  <script src="app.js"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

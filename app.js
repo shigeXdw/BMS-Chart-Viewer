@@ -12,6 +12,7 @@
     ".mp4", ".m4v", ".webm", ".ogv", ".ogg", ".mov", ".mpeg",
     ".mpg", ".mpe", ".ts", ".m2ts"
   ]);
+  const IMAGE_EXTENSIONS = new Set([".bmp", ".png", ".jpg", ".jpeg", ".gif", ".webp"]);
   const DIFFICULTIES = {
     1: ["BEGINNER", "#45dc67"],
     2: ["NORMAL", "#54a8ff"],
@@ -22,6 +23,7 @@
 
   const ui = {
     open: $("openButton"),
+    theme: $("themeButton"),
     folder: $("folderInput"),
     select: $("chartSelect"),
     play: $("playButton"),
@@ -32,6 +34,8 @@
     back: $("backButton"),
     forward: $("forwardButton"),
     video: $("bga"),
+    layerVideo: $("bgaLayerVideo"),
+    bgaCanvas: $("bgaCanvas"),
     placeholder: $("moviePlaceholder"),
     title: $("title"),
     artist: $("artist"),
@@ -68,11 +72,30 @@
     currentKps: $("currentKps"),
     peakKps: $("peakKps"),
     density: $("density"),
-    status: $("status")
+    status: $("status"),
+    playerView: $("playerView"),
+    inspectorView: $("inspectorView"),
+    inspectorTitle: $("inspectorTitle"),
+    inspectorSubtitle: $("inspectorSubtitle"),
+    inspectorColumnSize: $("inspectorColumnSize"),
+    inspectorCurrent: $("inspectorCurrentButton"),
+    inspectorScroller: $("inspectorScroller"),
+    measureGrid: $("measureGrid"),
+    laneDistribution: $("laneDistribution"),
+    densityGraph: $("densityGraph"),
+    notesRadar: $("notesRadar"),
+    analysisNotes: $("analysisNotes"),
+    analysisPeak: $("analysisPeak"),
+    analysisChord: $("analysisChord"),
+    analysisScratch: $("analysisScratch"),
+    analysisLong: $("analysisLong"),
+    analysisBpm: $("analysisBpm")
   };
 
   const ctx = ui.canvas.getContext("2d", { alpha: false, desynchronized: true });
+  const bgaCtx = ui.bgaCanvas.getContext("2d", { alpha: false });
   const modButtons = [...document.querySelectorAll(".mod-button")];
+  const viewButtons = [...document.querySelectorAll(".view-tab")];
 
   const state = {
     files: new Map(),
@@ -97,14 +120,45 @@
     playGeneration: 0,
     videoUrl: "",
     currentBga: "",
+    bgaFallbacks: [],
+    bgaFallbackIndex: 0,
+    bgaOffset: 0,
+    bgaAssets: new Map(),
+    bgaBase: null,
+    bgaLayer: null,
+    bgaWantedBase: "",
+    bgaWantedLayer: "",
+    bgaPreloadPromise: null,
+    bgaRenderToken: 0,
     failedAudio: new Set(),
     peakKps: 0,
     laneMod: "normal",
     laneMappings: [],
     suddenEnabled: false,
+    theme: "dark",
     canvasWidth: 1,
-    canvasHeight: 1
+    canvasHeight: 1,
+    iidxHispeed: 2,
+    fixedScrollSpeed: 720,
+    palette: {},
+    view: "player"
   };
+
+  function refreshPalette() {
+    const styles = getComputedStyle(document.documentElement);
+    for (const name of [
+      "--canvas-bg", "--lane-scratch", "--lane-white", "--lane-blue",
+      "--lane-border", "--judge-line", "--note-scratch", "--note-white",
+      "--note-blue", "--measure-line", "--cover-bg", "--cover-edge"
+      , "--ln-body", "--ln-edge"
+    ]) {
+      state.palette[name] = styles.getPropertyValue(name).trim();
+    }
+  }
+
+  function themeColor(name) {
+    return state.palette[name];
+  }
 
   function normalizePath(value) {
     return value.replaceAll("\\", "/").replace(/^\.?\//, "").toLowerCase();
@@ -116,6 +170,25 @@
     return dot < 0
       ? { basename, stem: basename, extension: "" }
       : { basename, stem: basename.slice(0, dot), extension: basename.slice(dot) };
+  }
+
+  function mediaCandidates(path, mediaType) {
+    const target = normalizePath(path);
+    const exact = state.files.get(target);
+    const { basename, stem } = splitFilename(target);
+    const family = mediaType === "audio" ? AUDIO_EXTENSIONS : VIDEO_EXTENSIONS;
+    const matches = [...state.files.entries()]
+      .filter(([key]) => {
+        const candidate = splitFilename(key);
+        return candidate.stem === stem && family.has(candidate.extension);
+      })
+      .map(([, file]) => file);
+
+    if (exact) return [exact, ...matches.filter((file) => file !== exact)];
+    const basenameMatches = [...state.files.entries()]
+      .filter(([key]) => key.endsWith("/" + basename) || key === basename)
+      .map(([, file]) => file);
+    return [...basenameMatches, ...matches.filter((file) => !basenameMatches.includes(file))];
   }
 
   function decodeText(file) {
@@ -239,7 +312,190 @@
       name, header, base, wav, bmp, events, playable, longNotes, bpmChanges,
       duration, lanes, beatToSeconds, secondsToBeat, measureStarts: starts,
       hitNotes, displayNotes, bgmEvents, keyEvents, bgaEvents,
+      layerEvents: events.filter((event) => event.channel === "07"),
+      poorEvents: events.filter((event) => event.channel === "06"),
       noteCount: Number(header.TOTALNOTES) || playable.length
+    };
+  }
+
+  function parseBmson(text, name) {
+    const data = JSON.parse(text.replace(/^\uFEFF/, ""));
+    const info = data.info || {};
+    const resolution = Number(info.resolution) || 240;
+    const initialBpm = Number(info.init_bpm) || 120;
+    const header = {
+      TITLE: [info.title, info.subtitle].filter(Boolean).join(" "),
+      ARTIST: info.artist || "",
+      GENRE: info.genre || "BMSON",
+      PLAYLEVEL: String(info.level ?? ""),
+      BPM: String(initialBpm),
+      DIFFICULTY: String(difficultyFromName(info.chart_name || name))
+    };
+    const mode = String(info.mode_hint || "beat-7k").toLowerCase();
+    const lanes = mode.includes("14k") || mode.includes("10k") ? 16 : 8;
+    const bpmRaw = [{ y: 0, bpm: initialBpm }, ...(data.bpm_events || [])]
+      .map((event) => ({ y: Number(event.y) || 0, bpm: Number(event.bpm) || initialBpm }))
+      .sort((a, b) => a.y - b.y);
+    const stops = (data.stop_events || [])
+      .map((event) => ({ y: Number(event.y) || 0, duration: Number(event.duration) || 0 }))
+      .sort((a, b) => a.y - b.y);
+
+    function pulseToSeconds(pulse) {
+      let seconds = 0;
+      let cursor = 0;
+      let bpm = initialBpm;
+      let bpmIndex = 0;
+      let stopIndex = 0;
+      while (cursor < pulse) {
+        const nextBpm = bpmRaw[bpmIndex + 1]?.y ?? Infinity;
+        const nextStop = stops[stopIndex]?.y ?? Infinity;
+        const next = Math.min(pulse, nextBpm, nextStop);
+        seconds += (next - cursor) / resolution * 60 / bpm;
+        cursor = next;
+        if (cursor === nextBpm) {
+          bpmIndex++;
+          bpm = bpmRaw[bpmIndex].bpm;
+        }
+        if (cursor === nextStop && cursor < pulse) {
+          seconds += stops[stopIndex].duration / resolution * 60 / bpm;
+          stopIndex++;
+        } else if (cursor === nextStop) {
+          break;
+        }
+      }
+      return seconds;
+    }
+
+    function laneChannel(x, long = false) {
+      const value = Number(x);
+      const prefix = long ? "5" : "1";
+      if (lanes === 8) {
+        if (value === 8) return prefix + "6";
+        return prefix + (KEY_CHANNELS[value - 1] || "1");
+      }
+      if (value === 8) return prefix + "6";
+      if (value === 16) return (long ? "6" : "2") + "6";
+      if (value >= 9) return (long ? "6" : "2") + (KEY_CHANNELS[value - 9] || "1");
+      return prefix + (KEY_CHANNELS[value - 1] || "1");
+    }
+
+    const wav = new Map();
+    const bmp = new Map();
+    const events = [];
+    const visualByPosition = new Map();
+    (data.sound_channels || []).forEach((sound, soundIndex) => {
+      const object = `bmson-${soundIndex}`;
+      wav.set(object, sound.name || "");
+      const notes = [...(sound.notes || [])].sort((a, b) => Number(a.y) - Number(b.y));
+      const pulseGroups = new Map();
+      for (const note of notes) {
+        const pulse = Number(note.y) || 0;
+        if (!pulseGroups.has(pulse)) pulseGroups.set(pulse, []);
+        pulseGroups.get(pulse).push(note);
+      }
+      const pulses = [...pulseGroups.keys()].sort((a, b) => a - b);
+      let restartPulse = 0;
+      pulses.forEach((pulse, pulseIndex) => {
+        const group = pulseGroups.get(pulse);
+        if (group.some((note) => !note.c)) restartPulse = pulse;
+        const nextPulse = pulses[pulseIndex + 1];
+        const audioOffset = Math.max(0, pulseToSeconds(pulse) - pulseToSeconds(restartPulse));
+        const audioDuration = nextPulse == null ? undefined : Math.max(0, pulseToSeconds(nextPulse) - pulseToSeconds(pulse));
+        for (const note of group) {
+          const x = Number(note.x) || 0;
+          const length = Number(note.l) || 0;
+          const baseEvent = {
+            beat: pulse / resolution,
+            pulse,
+            measure: 0,
+            channel: x === 0 ? "01" : laneChannel(x, length > 0),
+            object,
+            time: pulseToSeconds(pulse),
+            audioOffset,
+            audioDuration,
+            bmson: true
+          };
+          events.push(baseEvent);
+          if (x > 0) {
+            const visualKey = `${x}:${pulse}`;
+            if (!visualByPosition.has(visualKey)) visualByPosition.set(visualKey, baseEvent);
+            if (length > 0) {
+              baseEvent.longStart = true;
+              const endEvent = {
+                ...baseEvent,
+                beat: (pulse + length) / resolution,
+                pulse: pulse + length,
+                time: pulseToSeconds(pulse + length),
+                audioOffset: undefined,
+                audioDuration: undefined,
+                longStart: false,
+                longPair: baseEvent
+              };
+              baseEvent.longPair = endEvent;
+              events.push(endEvent);
+            }
+          }
+        }
+      });
+    });
+
+    const bga = data.bga || {};
+    for (const image of bga.bga_header || []) bmp.set(String(image.id), image.name);
+    for (const event of bga.bga_events || []) {
+      events.push({ beat: Number(event.y) / resolution, pulse: Number(event.y), measure: 0, channel: "04", object: String(event.id), time: pulseToSeconds(Number(event.y)) });
+    }
+    for (const event of bga.layer_events || []) {
+      events.push({ beat: Number(event.y) / resolution, pulse: Number(event.y), measure: 0, channel: "07", object: String(event.id), time: pulseToSeconds(Number(event.y)), bmsonLayer: true });
+    }
+    for (const event of bga.poor_events || []) {
+      events.push({ beat: Number(event.y) / resolution, pulse: Number(event.y), measure: 0, channel: "06", object: String(event.id), time: pulseToSeconds(Number(event.y)) });
+    }
+
+    const maxPulse = Math.max(
+      resolution * 4,
+      ...events.map((event) => event.pulse || Math.round(event.beat * resolution)),
+      ...(data.lines || []).map((line) => Number(line.y) || 0)
+    );
+    let linePulses = (data.lines || []).map((line) => Number(line.y) || 0).sort((a, b) => a - b);
+    if (!linePulses.length) {
+      linePulses = [];
+      for (let pulse = 0; pulse <= maxPulse + resolution * 4; pulse += resolution * 4) linePulses.push(pulse);
+    }
+    if (linePulses[0] !== 0) linePulses.unshift(0);
+    const measureStarts = linePulses.map((pulse) => pulse / resolution);
+    for (const event of events) {
+      event.measure = Math.max(0, upperBoundValue(measureStarts, event.beat) - 1);
+    }
+    events.sort((a, b) => a.time - b.time);
+    const bpmChanges = bpmRaw.map((event) => ({ beat: event.y / resolution, bpm: event.bpm, time: pulseToSeconds(event.y) }));
+    const playable = [...visualByPosition.values()].filter((event) => !event.longStart);
+    const longNotes = events.filter((event) => /^[56]/.test(event.channel));
+    const hitNotes = [...visualByPosition.values()].sort((a, b) => a.time - b.time);
+    const displayNotes = [...playable, ...longNotes].sort((a, b) => a.time - b.time);
+    const bgmEvents = events.filter((event) => event.channel === "01");
+    const keyEvents = events.filter((event) => /^[12]/.test(event.channel) || (/^[56]/.test(event.channel) && event.longStart));
+    const duration = pulseToSeconds(maxPulse + resolution * 4);
+
+    function beatToSeconds(beat) { return pulseToSeconds(beat * resolution); }
+    function secondsToBeat(seconds) {
+      let low = 0, high = maxPulse + resolution * 8;
+      for (let count = 0; count < 32; count++) {
+        const middle = (low + high) / 2;
+        if (pulseToSeconds(middle) < seconds) low = middle;
+        else high = middle;
+      }
+      return (low + high) / 2 / resolution;
+    }
+
+    return {
+      name, header, base: "BMSON", wav, bmp, events, playable, longNotes, bpmChanges,
+      duration, lanes, beatToSeconds, secondsToBeat, measureStarts,
+      hitNotes, displayNotes, bgmEvents, keyEvents,
+      bgaEvents: events.filter((event) => event.channel === "04"),
+      layerEvents: events.filter((event) => event.channel === "07"),
+      poorEvents: events.filter((event) => event.channel === "06"),
+      noteCount: hitNotes.length,
+      format: "bmson"
     };
   }
 
@@ -310,6 +566,7 @@
     state.effects = [];
     updateLaneArrangement();
     draw(state.pausedAt);
+    if (state.view === "inspector") renderInspector();
   }
 
   function applySRandom(side) {
@@ -403,10 +660,14 @@
       ? AUDIO_EXTENSIONS
       : mediaType === "video"
         ? VIDEO_EXTENSIONS
+        : mediaType === "image"
+          ? IMAGE_EXTENSIONS
         : AUDIO_EXTENSIONS.has(extension)
           ? AUDIO_EXTENSIONS
           : VIDEO_EXTENSIONS.has(extension)
             ? VIDEO_EXTENSIONS
+            : IMAGE_EXTENSIONS.has(extension)
+              ? IMAGE_EXTENSIONS
             : null;
     if (!family) return null;
 
@@ -417,8 +678,24 @@
     return alternatives.length === 1 ? alternatives[0][1] : null;
   }
 
+  function supportsHevc() {
+    return [
+      'video/mp4; codecs="hvc1"',
+      'video/mp4; codecs="hev1"'
+    ].some((type) => ui.video.canPlayType(type) !== "");
+  }
+
   async function loadFolder(fileList) {
     stop();
+    for (const assetPromise of state.bgaAssets.values()) {
+      Promise.resolve(assetPromise).then((asset) => {
+        if (asset?.kind === "video") URL.revokeObjectURL(asset.url);
+        if (asset?.kind === "image") asset.source?.close?.();
+      });
+    }
+    state.bgaAssets.clear();
+    state.bgaBase = null;
+    state.bgaLayer = null;
     state.files.clear();
     state.charts = [];
     for (const file of fileList) {
@@ -427,9 +704,12 @@
       parts.shift();
       state.files.set(normalizePath(parts.join("/")), file);
     }
-    const chartFiles = [...state.files.values()].filter((file) => /\.(bms|bme)$/i.test(file.name));
+    const chartFiles = [...state.files.values()].filter((file) => /\.(bms|bme|bmson)$/i.test(file.name));
     for (const file of chartFiles) {
-      try { state.charts.push(parseChart(await decodeText(file), file.name)); }
+      try {
+        const text = /\.bmson$/i.test(file.name) ? await file.text() : await decodeText(file);
+        state.charts.push(/\.bmson$/i.test(file.name) ? parseBmson(text, file.name) : parseChart(text, file.name));
+      }
       catch (error) { console.error(file.name, error); }
     }
     state.charts.sort((a, b) => a.name.localeCompare(b.name));
@@ -477,6 +757,9 @@
     applyLaneMod();
     updateNoteCounter(0);
     updateLiveStats(0);
+    renderInspector();
+    state.bgaPreloadPromise = preloadBgaAssets(c);
+    updateBga(0);
     draw(0);
   }
 
@@ -650,9 +933,15 @@
           if (!buffer || !state.playing) return;
           const source = state.audio.createBufferSource();
           source.buffer = buffer;
-          source.playbackRate.value = ui.pitchWithSpeed.checked ? playbackSpeed() : 1;
+          const changesPitch = ui.pitchWithSpeed.checked;
+          const speed = playbackSpeed();
+          source.playbackRate.value = changesPitch ? speed : 1;
           source.connect(state.gain);
-          source.start(Math.max(state.audio.currentTime, state.startAt + event.time / playbackSpeed()));
+          const when = Math.max(state.audio.currentTime, state.startAt + event.time / playbackSpeed());
+          const offset = Math.max(0, Number(event.audioOffset) || 0) / (changesPitch ? 1 : speed);
+          const duration = Number(event.audioDuration) / (changesPitch ? 1 : speed);
+          if (duration > 0) source.start(when, offset, duration);
+          else source.start(when, offset);
           state.sources.push(source);
         });
       }
@@ -671,15 +960,22 @@
 
       const currentChartTime = (state.audio.currentTime - state.startAt) * speed;
       const chartElapsed = currentChartTime - event.time;
-      const bufferOffset = changesPitch ? chartElapsed : chartElapsed / speed;
+      const sourceOffset = (Number(event.audioOffset) || 0) / (changesPitch ? 1 : speed);
+      const bufferOffset = sourceOffset + (changesPitch ? chartElapsed : chartElapsed / speed);
       if (bufferOffset < 0 || bufferOffset >= buffer.duration) continue;
+      const sourceDuration = Number(event.audioDuration) / (changesPitch ? 1 : speed);
+      if (sourceDuration > 0 && bufferOffset >= sourceOffset + sourceDuration) continue;
 
       state.scheduled.add(event);
       const source = state.audio.createBufferSource();
       source.buffer = buffer;
       source.playbackRate.value = changesPitch ? speed : 1;
       source.connect(state.gain);
-      source.start(state.audio.currentTime, bufferOffset);
+      const remaining = sourceDuration > 0
+        ? sourceOffset + sourceDuration - bufferOffset
+        : undefined;
+      if (remaining > 0) source.start(state.audio.currentTime, bufferOffset, remaining);
+      else source.start(state.audio.currentTime, bufferOffset);
       state.sources.push(source);
     }
   }
@@ -716,7 +1012,8 @@
     state.nextScheduleAt = offset;
     state.lastUiUpdate = 0;
     state.playing = true;
-    state.currentBga = "";
+    state.bgaBase = null;
+    state.bgaLayer = null;
     ui.play.disabled = false;
     ui.play.textContent = "■";
     ui.play.title = "Pause";
@@ -735,6 +1032,7 @@
     state.playing = false;
     cancelAnimationFrame(state.frame);
     ui.video.pause();
+    ui.layerVideo.pause();
     ui.play.textContent = "▶";
     ui.play.title = "Resume";
     ui.status.textContent = `Paused at ${formatTime(state.pausedAt)}.`;
@@ -759,7 +1057,11 @@
     ui.seek.value = "0";
     ui.video.pause();
     ui.video.currentTime = 0;
-    state.currentBga = "";
+    ui.layerVideo.pause();
+    ui.layerVideo.currentTime = 0;
+    state.bgaBase = null;
+    state.bgaLayer = null;
+    renderBgaFrame();
     draw(0);
   }
 
@@ -781,6 +1083,7 @@
       updateLiveStats(time);
       updateLaneArrangement(time);
       updateTempoDisplay(time);
+      updateInspectorCurrent();
       ui.time.textContent = `${formatTime(time)} / ${formatTime(state.chart.duration)}`;
       if (!state.seeking) ui.seek.value = String(Math.round(time / state.chart.duration * 1000));
       state.lastUiUpdate = frameTime;
@@ -806,23 +1109,140 @@
   }
 
   function updateBga(time) {
-    const eventIndex = upperBoundTime(state.chart.bgaEvents, time) - 1;
-    const event = eventIndex >= 0 ? state.chart.bgaEvents[eventIndex] : null;
+    updateBgaSlot("base", state.chart.bgaEvents, time);
+    updateBgaSlot("layer", state.chart.layerEvents || [], time);
+    renderBgaFrame();
+  }
+
+  function updateBgaSlot(slotName, events, time) {
+    const eventIndex = upperBoundTime(events, time) - 1;
+    const event = eventIndex >= 0 ? events[eventIndex] : null;
     const path = event ? state.chart.bmp.get(event.object) : "";
-    if (!path || path === state.currentBga) return;
-    const file = findFile(path, "video");
-    if (!file) return;
-    if (state.videoUrl) URL.revokeObjectURL(state.videoUrl);
-    state.videoUrl = URL.createObjectURL(file);
-    state.currentBga = path;
-    ui.video.src = state.videoUrl;
-    ui.video.style.display = "block";
-    ui.placeholder.style.display = "none";
-    ui.video.currentTime = Math.max(0, time - event.time);
-    ui.video.playbackRate = playbackSpeed();
-    ui.video.preservesPitch = !ui.pitchWithSpeed.checked;
-    if (state.playing) ui.video.play().catch(() => {});
-    else ui.video.pause();
+    const current = slotName === "base" ? state.bgaBase : state.bgaLayer;
+    if (!path) {
+      if (slotName === "base") {
+        state.bgaBase = null;
+        state.bgaWantedBase = "";
+      } else {
+        state.bgaLayer = null;
+        state.bgaWantedLayer = "";
+      }
+      return;
+    }
+    if (current?.path === path) {
+      if (current.kind === "video") syncBgaVideo(current, time);
+      return;
+    }
+    if (slotName === "base") state.bgaWantedBase = path;
+    else state.bgaWantedLayer = path;
+    loadBgaAsset(path, slotName === "layer", Boolean(event?.bmsonLayer)).then((asset) => {
+      const wanted = slotName === "base" ? state.bgaWantedBase : state.bgaWantedLayer;
+      if (!asset || wanted !== path) return;
+      const slot = { ...asset, path, eventTime: event.time };
+      if (slotName === "base") state.bgaBase = slot;
+      else state.bgaLayer = slot;
+      if (slot.kind === "video") {
+        const media = slotName === "base" ? ui.video : ui.layerVideo;
+        slot.media = media;
+        media.src = slot.url;
+        media.playbackRate = playbackSpeed();
+        media.preservesPitch = !ui.pitchWithSpeed.checked;
+        media.currentTime = Math.max(0, time - event.time);
+        if (state.playing) media.play().catch(() => {});
+      }
+      renderBgaFrame();
+    });
+  }
+
+  async function loadBgaAsset(path, isLayer, preserveAlpha) {
+    const cacheKey = `${normalizePath(path)}:${isLayer && !preserveAlpha ? "keyed" : "normal"}`;
+    if (state.bgaAssets.has(cacheKey)) return state.bgaAssets.get(cacheKey);
+    const promise = (async () => {
+      const extension = splitFilename(path).extension;
+      if (VIDEO_EXTENSIONS.has(extension)) {
+        const file = mediaCandidates(path, "video")[0];
+        return file ? { kind: "video", url: URL.createObjectURL(file) } : null;
+      }
+      const file = findFile(path, "image");
+      if (!file || !IMAGE_EXTENSIONS.has(splitFilename(file.name).extension.toLowerCase())) return null;
+      let bitmap = await createImageBitmap(file);
+      if (isLayer && !preserveAlpha) {
+        const keyed = document.createElement("canvas");
+        keyed.width = bitmap.width;
+        keyed.height = bitmap.height;
+        const keyedContext = keyed.getContext("2d", { willReadFrequently: true });
+        keyedContext.drawImage(bitmap, 0, 0);
+        const pixels = keyedContext.getImageData(0, 0, keyed.width, keyed.height);
+        for (let index = 0; index < pixels.data.length; index += 4) {
+          if (pixels.data[index] <= 2 && pixels.data[index + 1] <= 2 && pixels.data[index + 2] <= 2) {
+            pixels.data[index + 3] = 0;
+          }
+        }
+        keyedContext.putImageData(pixels, 0, 0);
+        bitmap.close();
+        bitmap = await createImageBitmap(keyed);
+      }
+      return { kind: "image", source: bitmap };
+    })();
+    state.bgaAssets.set(cacheKey, promise);
+    return promise;
+  }
+
+  async function preloadBgaAssets(chart) {
+    const requests = new Map();
+    for (const event of chart.bgaEvents) {
+      const path = chart.bmp.get(event.object);
+      if (path) requests.set(`${path}:base`, [path, false, true]);
+    }
+    for (const event of chart.layerEvents || []) {
+      const path = chart.bmp.get(event.object);
+      if (path) requests.set(`${path}:layer:${Boolean(event.bmsonLayer)}`, [path, true, Boolean(event.bmsonLayer)]);
+    }
+    const assets = [...requests.values()];
+    for (let start = 0; start < assets.length; start += 16) {
+      await Promise.all(assets.slice(start, start + 16).map((args) => loadBgaAsset(...args)));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  function syncBgaVideo(slot, time) {
+    if (!slot.media) return;
+    const expected = Math.max(0, time - slot.eventTime) / playbackSpeed();
+    if (Math.abs(slot.media.currentTime - expected) > 0.18) slot.media.currentTime = expected;
+    slot.media.playbackRate = playbackSpeed();
+    if (state.playing && slot.media.paused) slot.media.play().catch(() => {});
+  }
+
+  function drawBgaSource(source) {
+    if (!source) return;
+    const width = ui.bgaCanvas.width;
+    const height = ui.bgaCanvas.height;
+    const sourceWidth = source.videoWidth || source.width;
+    const sourceHeight = source.videoHeight || source.height;
+    if (!sourceWidth || !sourceHeight) return;
+    const scale = Math.min(width / sourceWidth, height / sourceHeight);
+    const targetWidth = sourceWidth * scale;
+    const targetHeight = sourceHeight * scale;
+    bgaCtx.drawImage(source, (width - targetWidth) / 2, (height - targetHeight) / 2, targetWidth, targetHeight);
+  }
+
+  function renderBgaFrame() {
+    const rect = ui.bgaCanvas.getBoundingClientRect();
+    const ratio = Math.min(devicePixelRatio || 1, 1.5);
+    const width = Math.max(1, Math.round(rect.width * ratio));
+    const height = Math.max(1, Math.round(rect.height * ratio));
+    if (ui.bgaCanvas.width !== width || ui.bgaCanvas.height !== height) {
+      ui.bgaCanvas.width = width;
+      ui.bgaCanvas.height = height;
+    }
+    bgaCtx.clearRect(0, 0, width, height);
+    bgaCtx.fillStyle = "#000";
+    bgaCtx.fillRect(0, 0, width, height);
+    const baseSource = state.bgaBase?.kind === "video" ? state.bgaBase.media : state.bgaBase?.source;
+    const layerSource = state.bgaLayer?.kind === "video" ? state.bgaLayer.media : state.bgaLayer?.source;
+    drawBgaSource(baseSource);
+    drawBgaSource(layerSource);
+    ui.placeholder.style.display = baseSource || layerSource ? "none" : "grid";
   }
 
   async function seekTo(time) {
@@ -842,7 +1262,9 @@
     ui.time.textContent = `${formatTime(target)} / ${formatTime(state.chart.duration)}`;
     ui.seek.value = String(Math.round(target / state.chart.duration * 1000));
     ui.video.pause();
-    state.currentBga = "";
+    ui.layerVideo.pause();
+    state.bgaBase = null;
+    state.bgaLayer = null;
     updateBga(target);
     if (resume) await play();
     else draw(target);
@@ -872,6 +1294,11 @@
       cursor += width;
     }
     return geometry;
+  }
+
+  function isWhiteKeyLane(lane, lanes) {
+    const localLane = lanes === 16 && lane >= 8 ? lane - 7 : lane;
+    return localLane % 2 === 1;
   }
 
   function registerHits(previous, time) {
@@ -920,16 +1347,303 @@
     const currentKps = kpsEnd - kpsStart;
     if (state.playing) state.peakKps = Math.max(state.peakKps, currentKps);
 
-    const currentBeat = state.chart.secondsToBeat(time);
-    const measure = Math.max(0, upperBoundValue(state.chart.measureStarts, currentBeat) - 1);
-    const endMeasure = Math.min(measure + 4, state.chart.measureStarts.length - 1);
-    const endBeat = state.chart.measureStarts[endMeasure];
-    const densityStart = lowerBoundBeat(notes, currentBeat);
-    const densityEnd = lowerBoundBeat(notes, endBeat);
+    const densityWindow = 4 * playbackSpeed();
+    const densityStart = lowerBoundTime(notes, time);
+    const densityEnd = upperBoundTime(notes, time + densityWindow);
+    const density = (densityEnd - densityStart) / 4;
 
     ui.currentKps.textContent = currentKps.toFixed(1);
     ui.peakKps.textContent = state.peakKps.toFixed(1);
-    ui.density.textContent = String(Math.max(0, densityEnd - densityStart));
+    ui.density.textContent = density.toFixed(1);
+  }
+
+  function switchView(view) {
+    state.view = view === "inspector" ? "inspector" : "player";
+    ui.playerView.hidden = state.view !== "player";
+    ui.inspectorView.hidden = state.view !== "inspector";
+    viewButtons.forEach((button) => {
+      const active = button.dataset.view === state.view;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    if (state.view === "inspector") renderInspector();
+    else {
+      syncCanvasSize();
+      draw(state.pausedAt);
+      renderBgaFrame();
+    }
+  }
+
+  function chartAnalysis(chart) {
+    const notes = chart.hitNotes;
+    let peak = 0;
+    let left = 0;
+    for (let right = 0; right < notes.length; right++) {
+      while (notes[left]?.time < notes[right].time - 1) left++;
+      peak = Math.max(peak, right - left + 1);
+    }
+    const chords = new Map();
+    const laneCounts = Array(chart.lanes).fill(0);
+    let scratch = 0;
+    for (const note of notes) {
+      const key = note.beat.toFixed(6);
+      chords.set(key, (chords.get(key) || 0) + 1);
+      const lane = laneFor(note, chart.lanes);
+      laneCounts[lane]++;
+      if (lane === 0 || (chart.lanes === 16 && lane === 15)) scratch++;
+    }
+    const bpms = chart.bpmChanges.map((change) => change.bpm).filter(Number.isFinite);
+    const chordNotes = [...chords.values()].filter((count) => count >= 2).reduce((sum, count) => sum + count, 0);
+    const longCount = chart.longNotes.filter((note) => note.longStart).length;
+    const averageNps = notes.length / Math.max(1, chart.duration);
+    const bpmRatio = Math.max(...bpms) / Math.max(1, Math.min(...bpms));
+    const soflanChanges = Math.max(0, chart.bpmChanges.length - 1);
+    return {
+      peak,
+      maxChord: Math.max(0, ...chords.values()),
+      laneCounts,
+      scratch,
+      longNotes: longCount,
+      minBpm: Math.min(...bpms),
+      maxBpm: Math.max(...bpms),
+      radar: [
+        Math.min(1, averageNps / 8),
+        Math.min(1, peak / 18),
+        Math.min(1, scratch / Math.max(1, notes.length) / 0.2),
+        Math.min(1, (Math.log2(Math.max(1, bpmRatio)) / 2) + soflanChanges / 24),
+        Math.min(1, longCount / Math.max(1, notes.length) / 0.25),
+        Math.min(1, chordNotes / Math.max(1, notes.length) / 0.45)
+      ]
+    };
+  }
+
+  function renderInspector() {
+    const chart = state.chart;
+    if (!chart) return;
+    const analysis = chartAnalysis(chart);
+    ui.inspectorTitle.textContent = chart.header.TITLE || chart.name;
+    const modLabel = state.laneMod === "rrandom" ? "R-Random"
+      : state.laneMod === "srandom" ? "S-Random"
+        : state.laneMod[0].toUpperCase() + state.laneMod.slice(1);
+    ui.inspectorSubtitle.textContent = `${chart.header.ARTIST || "Unknown artist"} · ${chart.lanes === 16 ? "Double play" : "Single play"} · ${chart.measureStarts.length - 1} measures · ${modLabel}`;
+    ui.analysisNotes.textContent = String(chart.noteCount);
+    ui.analysisPeak.textContent = analysis.peak.toFixed(1);
+    ui.analysisChord.textContent = String(analysis.maxChord);
+    ui.analysisScratch.textContent = String(analysis.scratch);
+    ui.analysisLong.textContent = String(analysis.longNotes);
+    ui.analysisBpm.textContent = analysis.minBpm === analysis.maxBpm
+      ? String(analysis.minBpm)
+      : `${analysis.minBpm}-${analysis.maxBpm}`;
+    renderLaneDistribution(analysis.laneCounts);
+    renderDensityGraph(chart);
+    renderNotesRadar(analysis.radar);
+    renderMeasureGrid(chart);
+  }
+
+  function renderLaneDistribution(counts) {
+    const maximum = Math.max(1, ...counts);
+    ui.laneDistribution.replaceChildren();
+    counts.forEach((count, lane) => {
+      const row = document.createElement("div");
+      row.className = "lane-stat";
+      const label = document.createElement("span");
+      label.textContent = lane === 0 || (counts.length === 16 && lane === 15)
+        ? "SC"
+        : String(counts.length === 16 && lane >= 8 ? lane - 7 : lane);
+      const meter = document.createElement("span");
+      meter.className = "lane-meter";
+      const fill = document.createElement("i");
+      fill.style.width = `${count / maximum * 100}%`;
+      meter.append(fill);
+      const value = document.createElement("b");
+      value.textContent = String(count);
+      row.append(label, meter, value);
+      ui.laneDistribution.append(row);
+    });
+  }
+
+  function renderDensityGraph(chart) {
+    const canvas = ui.densityGraph;
+    const context = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const bins = Math.max(24, Math.ceil(chart.duration / 2));
+    const values = Array(bins).fill(0);
+    for (const note of chart.hitNotes) {
+      const index = Math.min(bins - 1, Math.floor(note.time / chart.duration * bins));
+      values[index]++;
+    }
+    const maximum = Math.max(1, ...values);
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = state.theme === "light" ? "#aeb8bf" : "#0d1014";
+    context.fillRect(0, 0, width, height);
+    context.strokeStyle = state.theme === "light" ? "#006f94" : "#65d8ff";
+    context.lineWidth = 2;
+    context.beginPath();
+    values.forEach((value, index) => {
+      const x = index / Math.max(1, bins - 1) * width;
+      const y = height - 8 - value / maximum * (height - 18);
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.stroke();
+  }
+
+  function renderNotesRadar(values) {
+    const canvas = ui.notesRadar;
+    const context = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const centerX = width / 2;
+    const centerY = height / 2 + 4;
+    const radius = Math.min(width * 0.31, height * 0.34);
+    const labels = ["NOTES", "PEAK", "SCRATCH", "SOF-LAN", "CHARGE", "CHORD"];
+    const colors = ["#f064cf", "#f6d64a", "#ff7c58", "#6d7cff", "#49d8df", "#b7e65c"];
+    const point = (axis, scale = 1) => {
+      const angle = -Math.PI / 2 + axis * Math.PI / 3;
+      return [centerX + Math.cos(angle) * radius * scale, centerY + Math.sin(angle) * radius * scale];
+    };
+
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = state.theme === "light" ? "#aeb8bf" : "#0d1014";
+    context.fillRect(0, 0, width, height);
+    for (let ring = 1; ring <= 4; ring++) {
+      context.beginPath();
+      for (let axis = 0; axis < 6; axis++) {
+        const [x, y] = point(axis, ring / 4);
+        if (axis === 0) context.moveTo(x, y);
+        else context.lineTo(x, y);
+      }
+      context.closePath();
+      context.strokeStyle = state.theme === "light" ? "rgba(44,57,66,.35)" : "rgba(185,205,216,.25)";
+      context.lineWidth = 1;
+      context.stroke();
+    }
+    for (let axis = 0; axis < 6; axis++) {
+      const [x, y] = point(axis);
+      context.beginPath();
+      context.moveTo(centerX, centerY);
+      context.lineTo(x, y);
+      context.stroke();
+    }
+
+    context.beginPath();
+    values.forEach((value, axis) => {
+      const [x, y] = point(axis, Math.max(0.06, value));
+      if (axis === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.closePath();
+    context.fillStyle = "rgba(217, 202, 31, .68)";
+    context.fill();
+    context.strokeStyle = "#fff46a";
+    context.lineWidth = 2;
+    context.stroke();
+
+    context.font = "700 12px Segoe UI, Arial, sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    labels.forEach((label, axis) => {
+      const [x, y] = point(axis, 1.22);
+      context.fillStyle = colors[axis];
+      context.fillText(label, x, y);
+    });
+  }
+
+  function renderMeasureGrid(chart) {
+    const measuresPerColumn = Number(ui.inspectorColumnSize.value) || 4;
+    const measureCount = Math.max(1, chart.measureStarts.length - 1);
+    const groups = Array.from({ length: measureCount }, () => []);
+    for (const note of chart.displayNotes) {
+      const measure = Math.min(measureCount - 1, Math.max(0, note.measure ?? upperBoundValue(chart.measureStarts, note.beat) - 1));
+      groups[measure].push(note);
+    }
+    ui.measureGrid.replaceChildren();
+    for (let start = 0; start < measureCount; start += measuresPerColumn) {
+      const column = document.createElement("div");
+      column.className = "measure-column";
+      for (let measure = start; measure < Math.min(measureCount, start + measuresPerColumn); measure++) {
+        const card = document.createElement("div");
+        card.className = "measure-card";
+        card.dataset.measure = String(measure);
+        const canvas = document.createElement("canvas");
+        canvas.width = 324;
+        canvas.height = 348;
+        drawMeasure(canvas, chart, measure, groups[measure]);
+        const number = document.createElement("span");
+        number.className = "measure-number";
+        number.textContent = String(measure + 1);
+        card.append(canvas, number);
+        card.addEventListener("click", () => {
+          switchView("player");
+          seekTo(chart.beatToSeconds(chart.measureStarts[measure]));
+        });
+        column.append(card);
+      }
+      ui.measureGrid.append(column);
+    }
+    updateInspectorCurrent();
+  }
+
+  function drawMeasure(canvas, chart, measure, notes) {
+    const context = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const startBeat = chart.measureStarts[measure];
+    const endBeat = chart.measureStarts[measure + 1] ?? startBeat + 4;
+    const laneWidth = width / chart.lanes;
+    context.fillStyle = state.theme === "light" ? "#9fa9b0" : "#090c0f";
+    context.fillRect(0, 0, width, height);
+    for (let lane = 0; lane < chart.lanes; lane++) {
+      context.fillStyle = lane === 0 || (chart.lanes === 16 && lane === 15)
+        ? (state.theme === "light" ? "#9b8d79" : "#19140d")
+        : isWhiteKeyLane(lane, chart.lanes)
+          ? (state.theme === "light" ? "#cbd1d5" : "#171a1e")
+          : (state.theme === "light" ? "#8e99a2" : "#0e1115");
+      context.fillRect(lane * laneWidth, 0, laneWidth, height);
+      context.strokeStyle = state.theme === "light" ? "#69757d" : "#34404a";
+      context.strokeRect(lane * laneWidth, 0, laneWidth, height);
+    }
+    context.strokeStyle = state.theme === "light" ? "#7c878f" : "#2e3942";
+    for (let division = 1; division < 16; division++) {
+      const y = height - division / 16 * height;
+      context.beginPath();
+      context.moveTo(0, y);
+      context.lineTo(width, y);
+      context.stroke();
+    }
+    const bpmEvents = chart.bpmChanges.filter((event) => event.beat >= startBeat && event.beat < endBeat);
+    for (const event of bpmEvents) {
+      const y = height - (event.beat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+      context.strokeStyle = "#ff5265";
+      context.lineWidth = 3;
+      context.beginPath();
+      context.moveTo(0, y);
+      context.lineTo(width, y);
+      context.stroke();
+    }
+    for (const note of notes) {
+      const lane = laneFor(note, chart.lanes);
+      const y = height - (note.beat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+      const scratch = lane === 0 || (chart.lanes === 16 && lane === 15);
+      context.fillStyle = scratch ? "#ffbf2f" : isWhiteKeyLane(lane, chart.lanes) ? "#f3f5f6" : "#377dff";
+      if (note.longStart && note.longPair) {
+        const pairBeat = Math.min(endBeat, note.longPair.beat);
+        const pairY = height - (pairBeat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+        context.fillStyle = "#31a8ff";
+        context.fillRect(lane * laneWidth + laneWidth * 0.25, pairY, laneWidth * 0.5, Math.max(4, y - pairY));
+      }
+      context.fillRect(lane * laneWidth + 2, y - 3, Math.max(2, laneWidth - 4), 6);
+    }
+  }
+
+  function updateInspectorCurrent() {
+    if (!state.chart) return;
+    const beat = state.chart.secondsToBeat(state.pausedAt);
+    const measure = Math.max(0, upperBoundValue(state.chart.measureStarts, beat) - 1);
+    for (const card of ui.measureGrid.querySelectorAll(".measure-card")) {
+      card.classList.toggle("current", Number(card.dataset.measure) === measure);
+    }
   }
 
   function upperBoundValue(items, value) {
@@ -967,7 +1681,8 @@
   function draw(time) {
     const width = state.canvasWidth, height = state.canvasHeight;
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#050607"; ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = themeColor("--canvas-bg");
+    ctx.fillRect(0, 0, width, height);
     const chart = state.chart;
     const lanes = chart?.lanes || 8;
     const widthScale = Number(ui.columnWidth.value) / 100;
@@ -980,13 +1695,17 @@
 
     for (let lane = 0; lane < lanes; lane++) {
       const column = geometry[lane];
-      ctx.fillStyle = column.scratch ? "#15120e" : (lane % 2 ? "#171a1e" : "#0e1115 ");
+      ctx.fillStyle = column.scratch
+        ? themeColor("--lane-scratch")
+        : isWhiteKeyLane(lane, lanes)
+          ? themeColor("--lane-white")
+          : themeColor("--lane-blue");
       ctx.fillRect(column.x, 0, column.width, height);
-      ctx.strokeStyle = lane === 8 ? "#dce4e9" : "#3d454d";
+      ctx.strokeStyle = themeColor("--lane-border");
       ctx.beginPath(); ctx.moveTo(column.x, 0); ctx.lineTo(column.x, height); ctx.stroke();
     }
     ctx.beginPath(); ctx.moveTo(left + fieldWidth, 0); ctx.lineTo(left + fieldWidth, height); ctx.stroke();
-    ctx.strokeStyle = "#f23c4d"; ctx.lineWidth = 3;
+    ctx.strokeStyle = themeColor("--judge-line"); ctx.lineWidth = 3;
     ctx.beginPath(); ctx.moveTo(left, judgeY); ctx.lineTo(left + fieldWidth, judgeY); ctx.stroke();
     ctx.lineWidth = 1;
 
@@ -1006,7 +1725,7 @@
           : (chart.beatToSeconds(beat) - time) * fixedPxPerSecond;
         if (distance < 0 || distance > height) continue;
         const y = judgeY - distance;
-        ctx.strokeStyle = "rgba(210, 226, 235, .46)";
+        ctx.strokeStyle = themeColor("--measure-line");
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.moveTo(left, y);
@@ -1017,21 +1736,52 @@
 
       const notes = chart.displayNotes;
       const noteThickness = Number(ui.noteThickness.value);
+      const noteDistance = (note) => ui.scrollMode.value === "iidx"
+        ? (note.beat - currentBeat) * pixelsPerBeat
+        : (note.time - time) * fixedPxPerSecond;
+
+      for (const note of chart.longNotes) {
+        if (!note.longStart || !note.longPair) continue;
+        const startDistance = noteDistance(note);
+        const endDistance = noteDistance(note.longPair);
+        if (endDistance <= 0 || startDistance > height || endDistance > height && startDistance > height) continue;
+        const lane = laneFor(note, lanes);
+        const column = geometry[lane];
+        const startY = Math.min(judgeY, judgeY - startDistance);
+        const endY = Math.max(0, judgeY - endDistance);
+        const bodyX = column.x + Math.max(5, column.width * 0.22);
+        const bodyWidth = Math.max(4, column.width - Math.max(10, column.width * 0.44));
+        ctx.fillStyle = themeColor("--ln-body");
+        ctx.fillRect(bodyX, endY, bodyWidth, Math.max(noteThickness, startY - endY));
+        ctx.strokeStyle = themeColor("--ln-edge");
+        ctx.strokeRect(bodyX + .5, endY + .5, bodyWidth - 1, Math.max(noteThickness, startY - endY) - 1);
+        ctx.fillStyle = column.scratch
+          ? themeColor("--note-scratch")
+          : isWhiteKeyLane(lane, lanes)
+            ? themeColor("--note-white")
+            : themeColor("--note-blue");
+        ctx.fillRect(column.x + 3, endY - noteThickness / 2, column.width - 6, noteThickness);
+        ctx.fillRect(column.x + 3, startY - noteThickness / 2, column.width - 6, noteThickness);
+      }
+
       const visibleStart = upperBoundTime(notes, time);
       const visibleEnd = ui.scrollMode.value === "fixed"
         ? upperBoundTime(notes, time + visibleSeconds)
         : upperBoundTime(notes, chart.beatToSeconds(lastBeat));
       for (let index = visibleStart; index < visibleEnd; index++) {
         const note = notes[index];
+        if (/^[56]/.test(note.channel)) continue;
         const delta = note.time - time;
-        const distance = ui.scrollMode.value === "iidx"
-          ? (note.beat - currentBeat) * pixelsPerBeat
-          : delta * fixedPxPerSecond;
+        const distance = noteDistance(note);
         if (distance <= 0 || (ui.scrollMode.value === "fixed" && delta > visibleSeconds) || distance > height) continue;
         const lane = laneFor(note, lanes);
         const column = geometry[lane];
         const y = judgeY - distance;
-        ctx.fillStyle = column.scratch ? "#ffbf2f" : (lane % 2 ? "#f1f4f5" : "#5b78ff");
+        ctx.fillStyle = column.scratch
+          ? themeColor("--note-scratch")
+          : isWhiteKeyLane(lane, lanes)
+            ? themeColor("--note-white")
+            : themeColor("--note-blue");
         ctx.fillRect(column.x + 3, y - noteThickness / 2, column.width - 6, noteThickness);
         ctx.fillStyle = "rgba(255,255,255,.55)";
         ctx.fillRect(column.x + 4, y - noteThickness / 2 + 1, column.width - 8, Math.min(2, noteThickness));
@@ -1039,9 +1789,9 @@
 
       if (state.suddenEnabled) {
         const coverHeight = judgeY * Number(ui.suddenAmount.value) / 100;
-        ctx.fillStyle = "rgba(5, 7, 9, .98)";
+        ctx.fillStyle = themeColor("--cover-bg");
         ctx.fillRect(left, 0, fieldWidth, coverHeight);
-        ctx.fillStyle = "#26323a";
+        ctx.fillStyle = themeColor("--cover-edge");
         ctx.fillRect(left, coverHeight - 3, fieldWidth, 3);
         ctx.fillStyle = "rgba(127, 225, 255, .28)";
         ctx.fillRect(left, coverHeight, fieldWidth, 1);
@@ -1078,11 +1828,25 @@
     const iidx = ui.scrollMode.value === "iidx";
     ui.speedLabel.textContent = iidx ? "Hi-Speed" : "Scroll speed";
     if (iidx) {
-      ui.speedValue.value = `${hiSpeed().toFixed(2)}x`;
+      ui.speed.min = "1";
+      ui.speed.max = "1999";
+      ui.speed.step = "1";
+      ui.speed.value = String(Math.round(state.iidxHispeed * 100));
+      ui.speedValue.min = "0.01";
+      ui.speedValue.max = "19.99";
+      ui.speedValue.step = "0.01";
+      ui.speedValue.value = state.iidxHispeed.toFixed(2);
       updateTempoDisplay();
     } else {
+      ui.speed.min = "50";
+      ui.speed.max = "2000";
+      ui.speed.step = "10";
+      ui.speed.value = String(state.fixedScrollSpeed);
+      ui.speedValue.min = "50";
+      ui.speedValue.max = "2000";
+      ui.speedValue.step = "10";
+      ui.speedValue.value = String(state.fixedScrollSpeed);
       ui.scrollModeValue.value = "PX";
-      ui.speedValue.value = ui.speed.value;
     }
     draw(state.pausedAt);
   }
@@ -1099,15 +1863,69 @@
     if (state.chart && state.playing) seekTo(state.pausedAt);
   }
 
+  function clamp(value, minimum, maximum) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+
+  function setTheme(theme) {
+    state.theme = theme === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = state.theme;
+    ui.theme.textContent = state.theme === "dark" ? "\u2600" : "\u263e";
+    ui.theme.title = state.theme === "dark" ? "Use light theme" : "Use dark theme";
+    ui.theme.setAttribute("aria-label", ui.theme.title);
+    localStorage.setItem("bms-player-theme", state.theme);
+    refreshPalette();
+    draw(state.pausedAt);
+    renderBgaFrame();
+    if (state.chart && state.view === "inspector") renderInspector();
+  }
+
   function bindControls() {
     ui.open.addEventListener("click", () => ui.folder.click());
     ui.folder.addEventListener("change", () => loadFolder(ui.folder.files));
     ui.select.addEventListener("change", () => selectChart(Number(ui.select.value)));
     ui.play.addEventListener("click", () => state.playing ? pause() : play());
     ui.stop.addEventListener("click", stop);
+    viewButtons.forEach((button) => {
+      button.addEventListener("click", () => switchView(button.dataset.view));
+    });
+    ui.inspectorColumnSize.addEventListener("change", renderInspector);
+    ui.inspectorCurrent.addEventListener("click", () => {
+      updateInspectorCurrent();
+      const current = ui.measureGrid.querySelector(".measure-card.current");
+      current?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    });
 
     ui.scrollMode.addEventListener("change", updateScrollControls);
-    ui.speed.addEventListener("input", updateScrollControls);
+    ui.speed.addEventListener("input", () => {
+      if (ui.scrollMode.value === "iidx") {
+        state.iidxHispeed = Number(ui.speed.value) / 100;
+        ui.speedValue.value = state.iidxHispeed.toFixed(2);
+        updateTempoDisplay();
+      } else {
+        state.fixedScrollSpeed = Number(ui.speed.value);
+        ui.speedValue.value = String(state.fixedScrollSpeed);
+      }
+      draw(state.pausedAt);
+    });
+    ui.speedValue.addEventListener("input", () => {
+      const value = Number(ui.speedValue.value);
+      if (!Number.isFinite(value)) return;
+      if (ui.scrollMode.value === "iidx") {
+        state.iidxHispeed = clamp(value, 0.01, 19.99);
+        ui.speed.value = String(Math.round(state.iidxHispeed * 100));
+        updateTempoDisplay();
+      } else {
+        state.fixedScrollSpeed = clamp(value, 50, 2000);
+        ui.speed.value = String(state.fixedScrollSpeed);
+      }
+      draw(state.pausedAt);
+    });
+    ui.speedValue.addEventListener("change", () => {
+      ui.speedValue.value = ui.scrollMode.value === "iidx"
+        ? state.iidxHispeed.toFixed(2)
+        : String(state.fixedScrollSpeed);
+    });
     bindRange(ui.columnWidth, ui.columnWidthValue, "%");
     bindRange(ui.scratchWidth, ui.scratchWidthValue, "%");
     bindRange(ui.noteThickness, ui.noteThicknessValue, "px");
@@ -1133,10 +1951,21 @@
     });
 
     ui.songSpeed.addEventListener("input", () => {
-      ui.songSpeedValue.value = `${ui.songSpeed.value}%`;
+      ui.songSpeedValue.value = ui.songSpeed.value;
+      updateTempoDisplay();
+    });
+    ui.songSpeedValue.addEventListener("input", () => {
+      const value = Number(ui.songSpeedValue.value);
+      if (!Number.isFinite(value)) return;
+      const clamped = clamp(value, 50, 200);
+      ui.songSpeed.value = String(clamped);
       updateTempoDisplay();
     });
     ui.songSpeed.addEventListener("change", restartPlaybackForAudioChange);
+    ui.songSpeedValue.addEventListener("change", () => {
+      ui.songSpeedValue.value = ui.songSpeed.value;
+      restartPlaybackForAudioChange();
+    });
     ui.pitchWithSpeed.addEventListener("change", restartPlaybackForAudioChange);
 
     ui.volume.addEventListener("input", () => {
@@ -1159,22 +1988,27 @@
     });
     ui.back.addEventListener("click", () => seekTo(state.pausedAt - 10));
     ui.forward.addEventListener("click", () => seekTo(state.pausedAt + 10));
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    ui.video.addEventListener("error", () => {
-      const filename = state.currentBga.split(/[\\/]/).pop() || "BGA video";
-      ui.status.textContent = `${filename} could not be played by this browser.`;
+    ui.theme.addEventListener("click", () => {
+      setTheme(state.theme === "dark" ? "light" : "dark");
     });
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    for (const media of [ui.video, ui.layerVideo]) {
+      media.addEventListener("error", () => {
+        ui.status.textContent = "A BGA video could not be decoded by this browser.";
+      });
+    }
   }
 
   function initialize() {
     ui.songSpeed.value = "100";
-    ui.songSpeedValue.value = "100%";
+    ui.songSpeedValue.value = "100";
     ui.columnWidth.value = "80";
     ui.columnWidthValue.value = "80%";
     ui.scratchWidth.value = "155";
     ui.scratchWidthValue.value = "155%";
 
     bindControls();
+    setTheme(localStorage.getItem("bms-player-theme") || "dark");
 
     const canvasObserver = new ResizeObserver(() => {
       syncCanvasSize();
@@ -1185,6 +2019,7 @@
     syncCanvasSize();
     updateLaneArrangement();
     updateScrollControls();
+    ui.status.textContent += supportsHevc() ? " HEVC is available." : " HEVC is unavailable; compatible video fallbacks will be tried.";
   }
 
   initialize();
