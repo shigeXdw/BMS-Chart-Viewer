@@ -11,7 +11,7 @@ are read locally and never uploaded
 
 - `#BASE 36` and `#BASE 62`
 - 7-key and 14-key charts
-- MP4/WebM BGA using `#BMPxx` and channel `04`
+- MP4/WebM BGA
 - Multiple videos within one chart
 - Normal, Mirror, Random, R-Random, and S-Random lane layouts
 - SUDDEN+, IIDX-style Hi-Speed, playback speed, and pitch controls
