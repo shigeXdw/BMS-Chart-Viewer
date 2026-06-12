@@ -1,16 +1,11 @@
 # BMS Player
 
-A dependency-free browser player for previewing BMS and BME charts. Song files
-are read locally and never uploaded.
+A dependency-free browser player for previewing BMS and BME charts, Song files
+are read locally and never uploaded
 
 ## Live Player
 
 [Open BMS Player](https://shigexdw.github.io/BMS-Chart-Viewer/)
-
-## Usage
-
-Open `index.html` in Chrome or Edge, select **Open folder**, and choose the
-complete song folder.
 
 ## Features
 
@@ -25,9 +20,8 @@ complete song folder.
 ## GitHub Pages
 
 The project is static and can be hosted directly with GitHub Pages. Publish the
-repository root from the `main` branch; no build step or server is required.
+repository root from the `main` branch; no build step or server is required
 
 ## Limitations
 
-This is an autoplay preview. Manual judging, score storage, and BMSON parsing
-are not currently included.
+This is an autoplay preview. BMSON parsing is currently not included
