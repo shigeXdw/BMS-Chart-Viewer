@@ -4,6 +4,14 @@
   const $ = (id) => document.getElementById(id);
   const KEY_CHANNELS = ["1", "2", "3", "4", "5", "8", "9"];
   const LANE_ORDER = { "6": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "8": 6, "9": 7 };
+  const AUDIO_EXTENSIONS = new Set([
+    ".wav", ".wave", ".ogg", ".oga", ".opus", ".mp3", ".mp2",
+    ".m4a", ".aac", ".flac", ".aif", ".aiff", ".weba", ".caf"
+  ]);
+  const VIDEO_EXTENSIONS = new Set([
+    ".mp4", ".m4v", ".webm", ".ogv", ".ogg", ".mov", ".mpeg",
+    ".mpg", ".mpe", ".ts", ".m2ts"
+  ]);
   const DIFFICULTIES = {
     1: ["BEGINNER", "#45dc67"],
     2: ["NORMAL", "#54a8ff"],
@@ -89,6 +97,7 @@
     playGeneration: 0,
     videoUrl: "",
     currentBga: "",
+    failedAudio: new Set(),
     peakKps: 0,
     laneMod: "normal",
     laneMappings: [],
@@ -99,6 +108,14 @@
 
   function normalizePath(value) {
     return value.replaceAll("\\", "/").replace(/^\.?\//, "").toLowerCase();
+  }
+
+  function splitFilename(path) {
+    const basename = path.split("/").pop();
+    const dot = basename.lastIndexOf(".");
+    return dot < 0
+      ? { basename, stem: basename, extension: "" }
+      : { basename, stem: basename.slice(0, dot), extension: basename.slice(dot) };
   }
 
   function decodeText(file) {
@@ -347,12 +364,30 @@
     });
   }
 
-  function findFile(path) {
+  function findFile(path, mediaType = "") {
     const target = normalizePath(path);
     if (state.files.has(target)) return state.files.get(target);
-    const basename = target.split("/").pop();
+
+    const { basename, stem, extension } = splitFilename(target);
     const candidates = [...state.files.entries()].filter(([key]) => key.endsWith("/" + basename) || key === basename);
-    return candidates.length === 1 ? candidates[0][1] : null;
+    if (candidates.length === 1) return candidates[0][1];
+
+    const family = mediaType === "audio"
+      ? AUDIO_EXTENSIONS
+      : mediaType === "video"
+        ? VIDEO_EXTENSIONS
+        : AUDIO_EXTENSIONS.has(extension)
+          ? AUDIO_EXTENSIONS
+          : VIDEO_EXTENSIONS.has(extension)
+            ? VIDEO_EXTENSIONS
+            : null;
+    if (!family) return null;
+
+    const alternatives = [...state.files.entries()].filter(([key]) => {
+      const candidate = splitFilename(key);
+      return candidate.stem === stem && family.has(candidate.extension);
+    });
+    return alternatives.length === 1 ? alternatives[0][1] : null;
   }
 
   async function loadFolder(fileList) {
@@ -393,6 +428,7 @@
     state.chart = state.charts[index];
     state.buffers.clear();
     state.stretchedBuffers.clear();
+    state.failedAudio.clear();
     state.hitNotes.clear();
     state.effects = [];
     state.lastTime = 0;
@@ -456,9 +492,18 @@
   async function getAudioBuffer(object) {
     if (state.buffers.has(object)) return state.buffers.get(object);
     const path = state.chart.wav.get(object);
-    const file = path ? findFile(path) : null;
-    if (!file) return null;
-    const promise = file.arrayBuffer().then((data) => state.audio.decodeAudioData(data.slice(0))).catch(() => null);
+    const file = path ? findFile(path, "audio") : null;
+    if (!file) {
+      if (path) state.failedAudio.add(path);
+      return null;
+    }
+    const promise = file.arrayBuffer()
+      .then((data) => state.audio.decodeAudioData(data.slice(0)))
+      .catch((error) => {
+        state.failedAudio.add(file.name);
+        console.warn(`Could not decode audio file: ${file.name}`, error);
+        return null;
+      });
     state.buffers.set(object, promise);
     return promise;
   }
@@ -542,7 +587,11 @@
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 
-    ui.status.textContent = `${needed.length} audio files loaded. Starting playback.`;
+    if (state.failedAudio.size) {
+      ui.status.textContent = `${state.failedAudio.size} audio file(s) could not be decoded by this browser.`;
+    } else {
+      ui.status.textContent = `${needed.length} audio files loaded. Starting playback.`;
+    }
     return true;
   }
 
@@ -633,7 +682,9 @@
     ui.play.title = "Pause";
     if (offset > 0) resumeActiveBgm(offset, generation);
     scheduleAudioWindow(offset, offset + 8);
-    ui.status.textContent = "Playback running.";
+    ui.status.textContent = state.failedAudio.size
+      ? `Playback running with ${state.failedAudio.size} unsupported or missing audio file(s).`
+      : "Playback running.";
     tick();
   }
 
@@ -701,7 +752,7 @@
     const event = eventIndex >= 0 ? state.chart.bgaEvents[eventIndex] : null;
     const path = event ? state.chart.bmp.get(event.object) : "";
     if (!path || path === state.currentBga) return;
-    const file = findFile(path);
+    const file = findFile(path, "video");
     if (!file) return;
     if (state.videoUrl) URL.revokeObjectURL(state.videoUrl);
     state.videoUrl = URL.createObjectURL(file);
@@ -1048,6 +1099,10 @@
     });
     ui.back.addEventListener("click", () => seekTo(state.pausedAt - 10));
     ui.forward.addEventListener("click", () => seekTo(state.pausedAt + 10));
+    ui.video.addEventListener("error", () => {
+      const filename = state.currentBga.split(/[\\/]/).pop() || "BGA video";
+      ui.status.textContent = `${filename} could not be played by this browser.`;
+    });
   }
 
   function initialize() {
