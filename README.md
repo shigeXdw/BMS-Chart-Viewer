@@ -15,12 +15,7 @@ complete song folder.
 ## Features
 
 - `#BASE 36` and `#BASE 62`
-- BMS/BME encoded as Shift-JIS/CP932 or UTF-8
 - 7-key and 14-key charts
-- WAV keysounds and BGM channel `01`
-- BPM channels `03` and `08`
-- Variable measure lengths using channel `02`
-- Long-note channels `51-69`
 - MP4/WebM BGA using `#BMPxx` and channel `04`
 - Multiple videos within one chart
 - Normal, Mirror, Random, R-Random, and S-Random lane layouts
