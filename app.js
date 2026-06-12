@@ -344,7 +344,6 @@
   }
 
   function arrangementText(mapping) {
-    if (state.laneMod === "srandom") return "per note";
     const inverse = KEY_CHANNELS.map((target) => {
       const sourceIndex = mapping.indexOf(target);
       return sourceIndex >= 0 ? String(sourceIndex + 1) : "-";
@@ -352,13 +351,41 @@
     return inverse.join(" ");
   }
 
-  function updateLaneArrangement() {
+  function sRandomArrangement(side, time) {
+    if (!state.chart) return "no chart";
+    const notes = state.chart.hitNotes;
+    let index = lowerBoundTime(notes, time);
+
+    while (index < notes.length && (noteSide(notes[index]) !== side || notes[index].channel[1] === "6")) {
+      index++;
+    }
+    if (index >= notes.length) return "end";
+
+    const nextTime = notes[index].time;
+    const assignments = [];
+    while (index < notes.length && Math.abs(notes[index].time - nextTime) < 0.000001) {
+      const note = notes[index++];
+      if (noteSide(note) !== side || note.channel[1] === "6") continue;
+      const source = KEY_CHANNELS.indexOf(note.channel[1]) + 1;
+      const target = KEY_CHANNELS.indexOf(note.modKey) + 1;
+      assignments.push(`${source}>${target}`);
+    }
+    return assignments.join(" ") || "scratch";
+  }
+
+  function updateLaneArrangement(time = state.pausedAt) {
     const first = state.laneMappings[0] || KEY_CHANNELS;
-    ui.laneArrangement1.value = arrangementText(first);
+    ui.laneArrangement1.value = state.laneMod === "srandom"
+      ? sRandomArrangement(0, time)
+      : arrangementText(first);
     const doublePlay = state.chart?.lanes === 16;
     ui.laneArrangement2.hidden = !doublePlay;
     ui.laneArrangement2Label.hidden = !doublePlay;
-    if (doublePlay) ui.laneArrangement2.value = arrangementText(state.laneMappings[1] || KEY_CHANNELS);
+    if (doublePlay) {
+      ui.laneArrangement2.value = state.laneMod === "srandom"
+        ? sRandomArrangement(1, time)
+        : arrangementText(state.laneMappings[1] || KEY_CHANNELS);
+    }
     modButtons.forEach((button) => {
       button.classList.toggle("active", button.dataset.mod === state.laneMod);
     });
@@ -479,13 +506,26 @@
     return Number(ui.songSpeed.value) / 100;
   }
 
+  function hiSpeed() {
+    return Number(ui.speed.value) / 100;
+  }
+
+  function visibleLaneFraction() {
+    return state.suddenEnabled ? 1 - Number(ui.suddenAmount.value) / 100 : 1;
+  }
+
+  function greenNumber(time = state.pausedAt) {
+    if (!state.chart) return 0;
+    const effectiveBpm = bpmAt(time) * playbackSpeed();
+    return 240000 / (effectiveBpm * hiSpeed()) * visibleLaneFraction();
+  }
+
   function updateTempoDisplay(time = state.pausedAt) {
     if (!state.chart) return;
     const effectiveBpm = bpmAt(time) * playbackSpeed();
     ui.bpm.textContent = effectiveBpm.toFixed(effectiveBpm % 1 ? 1 : 0);
     if (ui.scrollMode.value === "iidx") {
-      const hiSpeed = 0.5 + (Number(ui.speed.value) - 300) / 1000 * 4;
-      ui.scrollModeValue.value = String(Math.round(effectiveBpm * hiSpeed));
+      ui.scrollModeValue.value = String(Math.round(greenNumber(time)));
     }
   }
 
@@ -739,12 +779,30 @@
     if (frameTime - state.lastUiUpdate >= 100) {
       updateNoteCounter(time);
       updateLiveStats(time);
+      updateLaneArrangement(time);
       updateTempoDisplay(time);
       ui.time.textContent = `${formatTime(time)} / ${formatTime(state.chart.duration)}`;
       if (!state.seeking) ui.seek.value = String(Math.round(time / state.chart.duration * 1000));
       state.lastUiUpdate = frameTime;
     }
     state.frame = requestAnimationFrame(tick);
+  }
+
+  function handleVisibilityChange() {
+    if (!state.playing || !state.chart) return;
+
+    const time = (state.audio.currentTime - state.startAt) * playbackSpeed();
+    if (document.hidden) {
+      // Background tabs throttle animation frames, so queue the remaining
+      // keysounds while the page still has an active AudioContext.
+      scheduleAudioWindow(time, state.chart.duration);
+      return;
+    }
+
+    state.pausedAt = time;
+    state.lastTime = time;
+    updateBga(time);
+    draw(time);
   }
 
   function updateBga(time) {
@@ -780,6 +838,7 @@
     state.playing = false;
     updateNoteCounter(target);
     updateLiveStats(target);
+    updateLaneArrangement(target);
     ui.time.textContent = `${formatTime(target)} / ${formatTime(state.chart.duration)}`;
     ui.seek.value = String(Math.round(target / state.chart.duration * 1000));
     ui.video.pause();
@@ -933,9 +992,7 @@
 
     if (chart) {
       const fixedPxPerSecond = Number(ui.speed.value);
-      const hiSpeed = 0.5 + (Number(ui.speed.value) - 300) / 1000 * 4;
-      const viewportScale = judgeY / 600;
-      const pixelsPerBeat = 92 * hiSpeed * viewportScale;
+      const pixelsPerBeat = judgeY * hiSpeed() / 4;
       const currentBeat = chart.secondsToBeat(time);
       const visibleSeconds = height / Math.max(1, fixedPxPerSecond);
       const lastBeat = Math.ceil(ui.scrollMode.value === "fixed"
@@ -1021,8 +1078,7 @@
     const iidx = ui.scrollMode.value === "iidx";
     ui.speedLabel.textContent = iidx ? "Hi-Speed" : "Scroll speed";
     if (iidx) {
-      const value = 0.5 + (Number(ui.speed.value) - 300) / 1000 * 4;
-      ui.speedValue.value = `${value.toFixed(2)}x`;
+      ui.speedValue.value = `${hiSpeed().toFixed(2)}x`;
       updateTempoDisplay();
     } else {
       ui.scrollModeValue.value = "PX";
@@ -1055,7 +1111,10 @@
     bindRange(ui.columnWidth, ui.columnWidthValue, "%");
     bindRange(ui.scratchWidth, ui.scratchWidthValue, "%");
     bindRange(ui.noteThickness, ui.noteThicknessValue, "px");
-    bindRange(ui.suddenAmount, ui.suddenAmountValue, "%");
+    bindRange(ui.suddenAmount, ui.suddenAmountValue, "%", () => {
+      updateTempoDisplay();
+      draw(state.pausedAt);
+    });
 
     modButtons.forEach((button) => {
       button.addEventListener("click", () => {
@@ -1069,6 +1128,7 @@
       ui.sudden.classList.toggle("active", state.suddenEnabled);
       ui.sudden.setAttribute("aria-pressed", String(state.suddenEnabled));
       ui.suddenAmount.disabled = !state.suddenEnabled;
+      updateTempoDisplay();
       draw(state.pausedAt);
     });
 
@@ -1099,6 +1159,7 @@
     });
     ui.back.addEventListener("click", () => seekTo(state.pausedAt - 10));
     ui.forward.addEventListener("click", () => seekTo(state.pausedAt + 10));
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     ui.video.addEventListener("error", () => {
       const filename = state.currentBga.split(/[\\/]/).pop() || "BGA video";
       ui.status.textContent = `${filename} could not be played by this browser.`;

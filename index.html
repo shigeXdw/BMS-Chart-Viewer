@@ -83,15 +83,15 @@
           <label>
             <span>Mode</span>
             <select id="scrollMode" aria-label="Scroll mode">
-              <option value="iidx" selected>IIDX Hi-Speed</option>
+            <option value="iidx" selected>IIDX Floating Hi-Speed</option>
               <option value="fixed">Fixed px/sec</option>
             </select>
-            <output id="scrollModeValue">--</output>
+            <output id="scrollModeValue" title="Green number (note visibility in milliseconds)">--</output>
           </label>
           <label>
             <span id="speedLabel">Hi-Speed</span>
-            <input id="speed" type="range" min="300" max="1300" value="720" step="20">
-            <output id="speedValue">2.50x</output>
+            <input id="speed" type="range" min="50" max="1000" value="200" step="1">
+            <output id="speedValue">2.00x</output>
           </label>
         </div>
 
