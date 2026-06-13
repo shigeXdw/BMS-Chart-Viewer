@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>B62 BMS Player</title>
-  <link rel="stylesheet" href="styles.css?v=14">
+  <link rel="stylesheet" href="styles.css?v=21">
 </head>
 <body>
   <header class="topbar">
@@ -20,8 +20,8 @@
       <button class="view-tab" type="button" data-view="inspector" aria-selected="false">Chart Inspector</button>
     </nav>
     <div class="transport">
-      <button id="themeButton" class="icon-button" type="button" title="Switch theme" aria-label="Switch theme">☀</button>
       <button id="openButton" class="command">Open folder</button>
+      <button id="openOszButton" class="command">Open OSZ</button>
       <select id="chartSelect" aria-label="Chart" disabled>
         <option>No chart loaded</option>
       </select>
@@ -45,8 +45,8 @@
         </div>
         <div>
           <span>Density</span>
-          <strong id="density">0</strong>
-          <small>notes/sec, next 4s</small>
+            <strong id="density">0</strong>
+            <small>notes/sec, last 2s</small>
         </div>
       </section>
       <div class="seekbar">
@@ -205,6 +205,10 @@
           </select>
         </label>
         <button id="inspectorCurrentButton" type="button">Jump to current</button>
+        <label class="inspector-follow">
+          <input id="inspectorFollow" type="checkbox" checked>
+          <span>Auto-follow</span>
+        </label>
       </div>
     </header>
     <section class="analysis-strip" aria-label="Chart summary">
@@ -239,6 +243,10 @@
   </main>
 
   <input id="folderInput" type="file" webkitdirectory multiple hidden>
-  <script src="app.js?v=13"></script>
+  <input id="oszInput" type="file" accept=".osz,application/zip" hidden>
+  <script src="vendor/fflate.min.js"></script>
+  <script src="vendor/rosu_pp_wasm.js"></script>
+  <script src="vendor/rosu_pp_classic.js"></script>
+  <script src="app.js?v=26"></script>
 </body>
 </html>

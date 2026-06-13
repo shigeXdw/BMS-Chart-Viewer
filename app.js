@@ -23,8 +23,9 @@
 
   const ui = {
     open: $("openButton"),
-    theme: $("themeButton"),
+    openOsz: $("openOszButton"),
     folder: $("folderInput"),
+    osz: $("oszInput"),
     select: $("chartSelect"),
     play: $("playButton"),
     stop: $("stopButton"),
@@ -79,6 +80,7 @@
     inspectorSubtitle: $("inspectorSubtitle"),
     inspectorColumnSize: $("inspectorColumnSize"),
     inspectorCurrent: $("inspectorCurrentButton"),
+    inspectorFollow: $("inspectorFollow"),
     inspectorScroller: $("inspectorScroller"),
     measureGrid: $("measureGrid"),
     laneDistribution: $("laneDistribution"),
@@ -135,13 +137,13 @@
     laneMod: "normal",
     laneMappings: [],
     suddenEnabled: false,
-    theme: "dark",
     canvasWidth: 1,
     canvasHeight: 1,
     iidxHispeed: 2,
     fixedScrollSpeed: 720,
     palette: {},
-    view: "player"
+    view: "player",
+    followedMeasure: -1
   };
 
   function refreshPalette() {
@@ -326,6 +328,7 @@
     const header = {
       TITLE: [info.title, info.subtitle].filter(Boolean).join(" "),
       ARTIST: info.artist || "",
+      SUBARTIST: (info.subartists || []).join(", "),
       GENRE: info.genre || "BMSON",
       PLAYLEVEL: String(info.level ?? ""),
       BPM: String(initialBpm),
@@ -496,6 +499,240 @@
       poorEvents: events.filter((event) => event.channel === "06"),
       noteCount: hitNotes.length,
       format: "bmson"
+    };
+  }
+
+  async function calculateOsuStars(bytes) {
+    try {
+      if (!globalThis.rosuPp) throw new Error("rosu-pp did not load");
+      if (!globalThis.rosuPpReady) {
+        const binary = atob(globalThis.ROSU_PP_WASM_BASE64);
+        const wasm = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index++) wasm[index] = binary.charCodeAt(index);
+        globalThis.rosuPp.initSync({ module: wasm });
+        globalThis.rosuPpReady = true;
+        delete globalThis.ROSU_PP_WASM_BASE64;
+      }
+      const map = new globalThis.rosuPp.Beatmap(bytes);
+      const calculator = new globalThis.rosuPp.Difficulty({ lazer: true });
+      try {
+        if (map.isSuspicious()) return null;
+        const attributes = calculator.calculate(map);
+        try {
+          return attributes.stars;
+        } finally {
+          attributes.free();
+        }
+      } finally {
+        calculator.free();
+        map.free();
+      }
+    } catch (error) {
+      console.warn("Could not calculate osu! star rating", error);
+      return null;
+    }
+  }
+
+  function parseOsuSections(text) {
+    const sections = new Map();
+    let current = "";
+    for (const source of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+      const line = source.trim();
+      if (!line || line.startsWith("//")) continue;
+      const section = line.match(/^\[(.+)]$/);
+      if (section) {
+        current = section[1];
+        sections.set(current, []);
+      } else if (current) {
+        sections.get(current).push(line);
+      }
+    }
+    return sections;
+  }
+
+  function osuPairs(lines = []) {
+    const values = {};
+    for (const line of lines) {
+      const separator = line.indexOf(":");
+      if (separator < 0) continue;
+      values[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+    }
+    return values;
+  }
+
+  function unquote(value) {
+    return String(value || "").trim().replace(/^"(.*)"$/, "$1");
+  }
+
+  async function parseOsu(bytes, name) {
+    const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
+    const sections = parseOsuSections(text);
+    const general = osuPairs(sections.get("General"));
+    const metadata = osuPairs(sections.get("Metadata"));
+    const difficulty = osuPairs(sections.get("Difficulty"));
+    if (Number(general.Mode) !== 3) return null;
+
+    const lanes = Math.max(1, Math.min(18, Math.round(Number(difficulty.CircleSize) || 4)));
+    const timingPoints = (sections.get("TimingPoints") || [])
+      .map((line) => line.split(","))
+      .filter((parts) => Number(parts[1]) > 0 && Number(parts[6]) === 1)
+      .map((parts) => ({
+        time: Number(parts[0]) / 1000,
+        beatLength: Number(parts[1]) / 1000,
+        meter: Math.max(1, Number(parts[2]) || 4)
+      }))
+      .sort((a, b) => a.time - b.time);
+    if (!timingPoints.length) timingPoints.push({ time: 0, beatLength: 0.5, meter: 4 });
+
+    timingPoints[0].beat = timingPoints[0].time / timingPoints[0].beatLength;
+    for (let index = 1; index < timingPoints.length; index++) {
+      const previous = timingPoints[index - 1];
+      const point = timingPoints[index];
+      point.beat = previous.beat + (point.time - previous.time) / previous.beatLength;
+    }
+
+    function secondsToBeat(seconds) {
+      let point = timingPoints[0];
+      for (const candidate of timingPoints) {
+        if (candidate.time > seconds) break;
+        point = candidate;
+      }
+      return point.beat + (seconds - point.time) / point.beatLength;
+    }
+
+    function beatToSeconds(beat) {
+      let point = timingPoints[0];
+      for (const candidate of timingPoints) {
+        if (candidate.beat > beat) break;
+        point = candidate;
+      }
+      return point.time + (beat - point.beat) * point.beatLength;
+    }
+
+    const events = [];
+    const playable = [];
+    const longNotes = [];
+    const wav = new Map();
+    const keyEvents = [];
+    const sampleObjects = new Map();
+    function sampleObject(filename) {
+      const path = unquote(filename);
+      if (!path) return "osu-hit";
+      const key = normalizePath(path);
+      if (!sampleObjects.has(key)) {
+        const object = `osu-sample-${sampleObjects.size}`;
+        sampleObjects.set(key, object);
+        wav.set(object, path);
+      }
+      return sampleObjects.get(key);
+    }
+
+    for (const line of sections.get("HitObjects") || []) {
+      const parts = line.split(",");
+      const x = Number(parts[0]);
+      const time = Number(parts[2]) / 1000;
+      const type = Number(parts[3]);
+      if (!Number.isFinite(x) || !Number.isFinite(time)) continue;
+      const lane = Math.max(0, Math.min(lanes - 1, Math.floor(x * lanes / 512)));
+      const beat = secondsToBeat(time);
+      const hitSample = String(parts[5] || "").split(":");
+      const customFilename = type & 128 ? hitSample.slice(5).join(":") : hitSample.slice(4).join(":");
+      const object = sampleObject(customFilename);
+      if (type & 128) {
+        const endTime = Number(hitSample[0]) / 1000;
+        const start = {
+          time, beat, lane, measure: 0, channel: "51", object,
+          longStart: true, osu: true
+        };
+        const end = {
+          time: Math.max(time, endTime),
+          beat: secondsToBeat(Math.max(time, endTime)),
+          lane, measure: 0, channel: "51", object,
+          longStart: false, longPair: start, osu: true
+        };
+        start.longPair = end;
+        longNotes.push(start, end);
+        events.push(start, end);
+        if (customFilename) keyEvents.push(start);
+      } else {
+        const note = { time, beat, lane, measure: 0, channel: "11", object, osu: true };
+        playable.push(note);
+        events.push(note);
+        if (customFilename) keyEvents.push(note);
+      }
+    }
+
+    const hitNotes = [...playable, ...longNotes.filter((note) => note.longStart)]
+      .sort((a, b) => a.time - b.time);
+    const duration = Math.max(1, ...events.map((event) => event.time + 2));
+    const maxBeat = Math.max(4, secondsToBeat(duration));
+    const measureStarts = [];
+    for (let beat = 0; beat <= maxBeat + 4; beat += 4) measureStarts.push(beat);
+    for (const event of events) {
+      event.measure = Math.max(0, upperBoundValue(measureStarts, event.beat) - 1);
+    }
+
+    const bgmEvents = [];
+    if (general.AudioFilename && findFile(unquote(general.AudioFilename), "audio")) {
+      wav.set("osu-audio", unquote(general.AudioFilename));
+      const bgm = { time: 0, beat: 0, measure: 0, channel: "01", object: "osu-audio", osu: true };
+      events.push(bgm);
+      bgmEvents.push(bgm);
+    }
+
+    const bmp = new Map();
+    const bgaEvents = [];
+    for (const line of sections.get("Events") || []) {
+      const parts = line.match(/(?:[^,"]+|"[^"]*")+/g) || [];
+      if (parts[0] === "0" && parts[2]) {
+        bmp.set("osu-bg", unquote(parts[2]));
+        bgaEvents.push({ time: 0, beat: 0, measure: 0, channel: "04", object: "osu-bg", osu: true });
+        break;
+      }
+    }
+
+    const stars = await calculateOsuStars(bytes);
+    const bpmChanges = timingPoints.map((point) => ({
+      time: point.time,
+      beat: point.beat,
+      bpm: 60 / point.beatLength
+    }));
+    const version = metadata.Version || "osu!mania";
+    return {
+      name,
+      header: {
+        TITLE: metadata.TitleUnicode || metadata.Title || name,
+        ARTIST: metadata.ArtistUnicode || metadata.Artist || "",
+        SUBARTIST: metadata.Creator ? `mapped by ${metadata.Creator}` : "",
+        GENRE: "osu!mania",
+        PLAYLEVEL: Number.isFinite(stars) ? stars.toFixed(2) + "★" : "--",
+        BPM: String(bpmChanges[0]?.bpm || 120),
+        DIFFICULTY: "0",
+        OSU_VERSION: version
+      },
+      base: "osu!",
+      wav,
+      bmp,
+      events: events.sort((a, b) => a.time - b.time),
+      playable,
+      longNotes,
+      bpmChanges,
+      duration,
+      lanes,
+      hasScratch: false,
+      beatToSeconds,
+      secondsToBeat,
+      measureStarts,
+      hitNotes,
+      displayNotes: [...playable, ...longNotes].sort((a, b) => a.time - b.time),
+      bgmEvents,
+      keyEvents: keyEvents.sort((a, b) => a.time - b.time),
+      bgaEvents,
+      layerEvents: [],
+      poorEvents: [],
+      noteCount: hitNotes.length,
+      format: "osu",
+      stars
     };
   }
 
@@ -685,7 +922,7 @@
     ].some((type) => ui.video.canPlayType(type) !== "");
   }
 
-  async function loadFolder(fileList) {
+  function resetLoadedContent() {
     stop();
     for (const assetPromise of state.bgaAssets.values()) {
       Promise.resolve(assetPromise).then((asset) => {
@@ -698,26 +935,32 @@
     state.bgaLayer = null;
     state.files.clear();
     state.charts = [];
-    for (const file of fileList) {
-      const relative = file.webkitRelativePath || file.name;
-      const parts = relative.split("/");
-      parts.shift();
-      state.files.set(normalizePath(parts.join("/")), file);
-    }
-    const chartFiles = [...state.files.values()].filter((file) => /\.(bms|bme|bmson)$/i.test(file.name));
+  }
+
+  async function loadCollectedFiles() {
+    const chartFiles = [...state.files.values()].filter((file) => /\.(bms|bme|bmson|osu)$/i.test(file.name));
     for (const file of chartFiles) {
       try {
+        if (/\.osu$/i.test(file.name)) {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          const chart = await parseOsu(bytes, file.name);
+          if (chart) state.charts.push(chart);
+          continue;
+        }
         const text = /\.bmson$/i.test(file.name) ? await file.text() : await decodeText(file);
         state.charts.push(/\.bmson$/i.test(file.name) ? parseBmson(text, file.name) : parseChart(text, file.name));
+      } catch (error) {
+        console.error(file.name, error);
       }
-      catch (error) { console.error(file.name, error); }
     }
     state.charts.sort((a, b) => a.name.localeCompare(b.name));
     ui.select.innerHTML = "";
     for (let index = 0; index < state.charts.length; index++) {
+      const chart = state.charts[index];
       const option = document.createElement("option");
       option.value = String(index);
-      option.textContent = state.charts[index].name;
+      option.textContent = chartSelectLabel(chart);
+      option.title = chart.name;
       ui.select.append(option);
     }
     ui.select.disabled = !state.charts.length;
@@ -730,6 +973,62 @@
     ui.status.textContent = `${state.charts.length} chart(s), ${state.files.size} files loaded.`;
   }
 
+  function chartSelectLabel(chart) {
+    const title = chart.header.TITLE || chart.name.replace(/\.(bms|bme|bmson|osu)$/i, "");
+    if (chart.format === "osu") {
+      const rating = Number.isFinite(chart.stars) ? chart.stars.toFixed(2) : "--";
+      const version = chart.header.OSU_VERSION || chart.name;
+      return `SR ${rating} | ${title} [${version}]`;
+    }
+    const level = chart.header.PLAYLEVEL || "--";
+    const difficulty = currentChartDifficultyLabel(chart);
+    return `LV ${level} | ${title}${difficulty ? ` [${difficulty}]` : ""}`;
+  }
+
+  function currentChartDifficultyLabel(chart) {
+    const difficulty = Number(chart.header.DIFFICULTY) || difficultyFromName(chart.name);
+    return (DIFFICULTIES[difficulty] || [chart.header.CHARTNAME || ""])[0];
+  }
+
+  function chartArtistLabel(chart) {
+    const artist = chart.header.ARTIST || "Unknown artist";
+    const subartist = chart.header.SUBARTIST;
+    return subartist ? `${artist} · ${subartist}` : artist;
+  }
+
+  async function loadFolder(fileList) {
+    resetLoadedContent();
+    for (const file of fileList) {
+      const relative = file.webkitRelativePath || file.name;
+      const parts = relative.split("/");
+      parts.shift();
+      state.files.set(normalizePath(parts.join("/")), file);
+    }
+    await loadCollectedFiles();
+  }
+
+  async function loadOsz(file) {
+    if (!file) return;
+    resetLoadedContent();
+    ui.status.textContent = `Opening ${file.name}...`;
+    try {
+      const archive = fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
+      for (const [path, bytes] of Object.entries(archive)) {
+        if (path.endsWith("/")) continue;
+        const name = path.split("/").pop();
+        state.files.set(normalizePath(path), new File([bytes], name));
+      }
+      await loadCollectedFiles();
+      const skipped = [...state.files.values()].filter((entry) => /\.osu$/i.test(entry.name)).length - state.charts.length;
+      if (skipped > 0) {
+        ui.status.textContent += ` ${skipped} non-mania chart(s) skipped.`;
+      }
+    } catch (error) {
+      console.error(file.name, error);
+      ui.status.textContent = `Could not open ${file.name}.`;
+    }
+  }
+
   function selectChart(index) {
     stop();
     state.chart = state.charts[index];
@@ -740,15 +1039,21 @@
     state.effects = [];
     state.lastTime = 0;
     state.peakKps = 0;
+    state.followedMeasure = -1;
     const c = state.chart;
     ui.title.textContent = c.header.TITLE || c.name;
-    ui.artist.textContent = c.header.ARTIST || "Unknown artist";
+    ui.artist.textContent = chartArtistLabel(c);
     ui.genre.textContent = c.header.GENRE || "BMS";
     ui.difficulty.textContent = c.header.PLAYLEVEL || "--";
-    const difficulty = Number(c.header.DIFFICULTY) || difficultyFromName(c.name);
-    const levelStyle = DIFFICULTIES[difficulty] || ["CHART", "#d5ff36"];
-    ui.difficulty.dataset.label = levelStyle[0];
-    ui.difficulty.style.setProperty("--level-color", levelStyle[1]);
+    if (c.format === "osu") {
+      ui.difficulty.dataset.label = "";
+      ui.difficulty.style.setProperty("--level-color", osuStarColor(c.stars));
+    } else {
+      const difficulty = Number(c.header.DIFFICULTY) || difficultyFromName(c.name);
+      const levelStyle = DIFFICULTIES[difficulty] || ["CHART", "#d5ff36"];
+      ui.difficulty.dataset.label = levelStyle[0];
+      ui.difficulty.style.setProperty("--level-color", levelStyle[1]);
+    }
     ui.notes.textContent = String(c.noteCount);
     ui.base.textContent = String(c.base);
     updateTempoDisplay(0);
@@ -783,6 +1088,36 @@
     if (value.includes("normal")) return 2;
     if (value.includes("beginner")) return 1;
     return 0;
+  }
+
+  function currentDifficultyStyle() {
+    const chart = state.chart;
+    if (chart?.format === "osu") return [chart.header.OSU_VERSION || "osu!mania", osuStarColor(chart.stars)];
+    const difficulty = Number(chart?.header.DIFFICULTY) || difficultyFromName(chart?.name || "");
+    return DIFFICULTIES[difficulty] || ["CHART", "#d5ff36"];
+  }
+
+  function osuStarColor(stars) {
+    const anchors = [
+      [0, "#4290fb"], [2, "#4fc0ff"], [2.7, "#4fffd5"], [3.3, "#7cff4f"],
+      [4, "#f6f05c"], [4.7, "#ff8068"], [5.3, "#ff4e6f"], [6, "#c645b8"],
+      [6.7, "#6563de"], [7.7, "#18158e"], [9, "#000000"]
+    ];
+    const value = Number.isFinite(stars) ? stars : 0;
+    let lower = anchors[0], upper = anchors[anchors.length - 1];
+    for (let index = 1; index < anchors.length; index++) {
+      if (value <= anchors[index][0]) {
+        lower = anchors[index - 1];
+        upper = anchors[index];
+        break;
+      }
+    }
+    const ratio = Math.max(0, Math.min(1, (value - lower[0]) / Math.max(0.001, upper[0] - lower[0])));
+    const rgb = [1, 3, 5].map((offset) => Math.round(
+      parseInt(lower[1].slice(offset, offset + 2), 16)
+      + (parseInt(upper[1].slice(offset, offset + 2), 16) - parseInt(lower[1].slice(offset, offset + 2), 16)) * ratio
+    ));
+    return `rgb(${rgb.join(",")})`;
   }
 
   function playbackSpeed() {
@@ -1063,6 +1398,7 @@
     state.bgaLayer = null;
     renderBgaFrame();
     draw(0);
+    updateInspectorCurrent();
   }
 
   function tick(frameTime = 0) {
@@ -1259,6 +1595,7 @@
     updateNoteCounter(target);
     updateLiveStats(target);
     updateLaneArrangement(target);
+    updateInspectorCurrent();
     ui.time.textContent = `${formatTime(target)} / ${formatTime(state.chart.duration)}`;
     ui.seek.value = String(Math.round(target / state.chart.duration * 1000));
     ui.video.pause();
@@ -1271,6 +1608,7 @@
   }
 
   function laneFor(note, lanes) {
+    if (typeof note !== "string" && Number.isInteger(note.lane)) return note.modLane ?? note.lane;
     const channel = typeof note === "string" ? note : note.channel;
     const side = Number(channel[0]);
     const key = typeof note === "string" ? channel[1] : (note.modKey || channel[1]);
@@ -1280,15 +1618,15 @@
     return local;
   }
 
-  function laneGeometry(lanes, fieldWidth, left) {
+  function laneGeometry(lanes, fieldWidth, left, hasScratch = true) {
     const scratchRatio = Number(ui.scratchWidth.value) / 100;
-    const scratchCount = lanes === 16 ? 2 : 1;
+    const scratchCount = hasScratch ? (lanes === 16 ? 2 : 1) : 0;
     const regularCount = lanes - scratchCount;
     const unit = fieldWidth / (regularCount + scratchCount * scratchRatio);
     const geometry = [];
     let cursor = left;
     for (let lane = 0; lane < lanes; lane++) {
-      const scratch = lane === 0 || (lanes === 16 && lane === 15);
+      const scratch = hasScratch && (lane === 0 || (lanes === 16 && lane === 15));
       const width = unit * (scratch ? scratchRatio : 1);
       geometry.push({ x: cursor, width, scratch });
       cursor += width;
@@ -1296,7 +1634,8 @@
     return geometry;
   }
 
-  function isWhiteKeyLane(lane, lanes) {
+  function isWhiteKeyLane(lane, lanes, hasScratch = true) {
+    if (!hasScratch) return lane % 2 === 0;
     const localLane = lanes === 16 && lane >= 8 ? lane - 7 : lane;
     return localLane % 2 === 1;
   }
@@ -1347,10 +1686,10 @@
     const currentKps = kpsEnd - kpsStart;
     if (state.playing) state.peakKps = Math.max(state.peakKps, currentKps);
 
-    const densityWindow = 4 * playbackSpeed();
-    const densityStart = lowerBoundTime(notes, time);
-    const densityEnd = upperBoundTime(notes, time + densityWindow);
-    const density = (densityEnd - densityStart) / 4;
+    const densityWindow = 2 * playbackSpeed();
+    const densityStart = lowerBoundTime(notes, Math.max(0, time - densityWindow));
+    const densityEnd = upperBoundTime(notes, time);
+    const density = (densityEnd - densityStart) / 2;
 
     ui.currentKps.textContent = currentKps.toFixed(1);
     ui.peakKps.textContent = state.peakKps.toFixed(1);
@@ -1390,14 +1729,24 @@
       chords.set(key, (chords.get(key) || 0) + 1);
       const lane = laneFor(note, chart.lanes);
       laneCounts[lane]++;
-      if (lane === 0 || (chart.lanes === 16 && lane === 15)) scratch++;
+      if (chart.hasScratch !== false && (lane === 0 || (chart.lanes === 16 && lane === 15))) scratch++;
     }
     const bpms = chart.bpmChanges.map((change) => change.bpm).filter(Number.isFinite);
-    const chordNotes = [...chords.values()].filter((count) => count >= 2).reduce((sum, count) => sum + count, 0);
+    const chordSizes = [...chords.values()].filter((count) => count >= 2);
+    const chordNotes = chordSizes.reduce((sum, count) => sum + count, 0);
+    const chordExcess = chordSizes.reduce((sum, count) => sum + count - 1, 0);
+    const chordRate = chordSizes.length / Math.max(1, chart.duration);
+    const averageChordSize = chordSizes.length ? chordNotes / chordSizes.length : 0;
     const longCount = chart.longNotes.filter((note) => note.longStart).length;
     const averageNps = notes.length / Math.max(1, chart.duration);
     const bpmRatio = Math.max(...bpms) / Math.max(1, Math.min(...bpms));
     const soflanChanges = Math.max(0, chart.bpmChanges.length - 1);
+    const chordRatio = chordExcess / Math.max(1, notes.length);
+    const chordScore = 100 * (
+      chordRatio / 0.22 * 0.55
+      + chordRate / 1.2 * 0.3
+      + Math.max(0, averageChordSize - 2) / 2 * 0.15
+    );
     return {
       peak,
       maxChord: Math.max(0, ...chords.values()),
@@ -1407,12 +1756,12 @@
       minBpm: Math.min(...bpms),
       maxBpm: Math.max(...bpms),
       radar: [
-        Math.min(1, averageNps / 8),
-        Math.min(1, peak / 18),
-        Math.min(1, scratch / Math.max(1, notes.length) / 0.2),
-        Math.min(1, (Math.log2(Math.max(1, bpmRatio)) / 2) + soflanChanges / 24),
-        Math.min(1, longCount / Math.max(1, notes.length) / 0.25),
-        Math.min(1, chordNotes / Math.max(1, notes.length) / 0.45)
+        Math.min(200, averageNps / 8 * 100),
+        Math.min(200, peak / 18 * 100),
+        Math.min(200, scratch / Math.max(1, notes.length) / 0.2 * 100),
+        Math.min(200, ((Math.log2(Math.max(1, bpmRatio)) / 2) + soflanChanges / 24) * 100),
+        Math.min(200, longCount / Math.max(1, notes.length) / 0.25 * 100),
+        Math.min(200, chordScore)
       ]
     };
   }
@@ -1425,7 +1774,7 @@
     const modLabel = state.laneMod === "rrandom" ? "R-Random"
       : state.laneMod === "srandom" ? "S-Random"
         : state.laneMod[0].toUpperCase() + state.laneMod.slice(1);
-    ui.inspectorSubtitle.textContent = `${chart.header.ARTIST || "Unknown artist"} · ${chart.lanes === 16 ? "Double play" : "Single play"} · ${chart.measureStarts.length - 1} measures · ${modLabel}`;
+    ui.inspectorSubtitle.textContent = `${chartArtistLabel(chart)} · ${chart.lanes === 16 ? "Double play" : "Single play"} · ${chart.measureStarts.length - 1} measures · ${modLabel}`;
     ui.analysisNotes.textContent = String(chart.noteCount);
     ui.analysisPeak.textContent = analysis.peak.toFixed(1);
     ui.analysisChord.textContent = String(analysis.maxChord);
@@ -1447,9 +1796,9 @@
       const row = document.createElement("div");
       row.className = "lane-stat";
       const label = document.createElement("span");
-      label.textContent = lane === 0 || (counts.length === 16 && lane === 15)
+      label.textContent = state.chart?.hasScratch !== false && (lane === 0 || (counts.length === 16 && lane === 15))
         ? "SC"
-        : String(counts.length === 16 && lane >= 8 ? lane - 7 : lane);
+        : String(state.chart?.hasScratch === false ? lane + 1 : counts.length === 16 && lane >= 8 ? lane - 7 : lane);
       const meter = document.createElement("span");
       meter.className = "lane-meter";
       const fill = document.createElement("i");
@@ -1464,9 +1813,19 @@
 
   function renderDensityGraph(chart) {
     const canvas = ui.densityGraph;
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    const cssWidth = Math.max(1, Math.round(canvas.clientWidth));
+    const cssHeight = Math.max(1, Math.round(canvas.clientHeight));
+    const backingWidth = Math.round(cssWidth * pixelRatio);
+    const backingHeight = Math.round(cssHeight * pixelRatio);
+    if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+      canvas.width = backingWidth;
+      canvas.height = backingHeight;
+    }
     const context = canvas.getContext("2d");
-    const width = canvas.width;
-    const height = canvas.height;
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    const width = cssWidth;
+    const height = cssHeight;
     const bins = Math.max(24, Math.ceil(chart.duration / 2));
     const values = Array(bins).fill(0);
     for (const note of chart.hitNotes) {
@@ -1475,9 +1834,9 @@
     }
     const maximum = Math.max(1, ...values);
     context.clearRect(0, 0, width, height);
-    context.fillStyle = state.theme === "light" ? "#aeb8bf" : "#0d1014";
+    context.fillStyle = "#0d1014";
     context.fillRect(0, 0, width, height);
-    context.strokeStyle = state.theme === "light" ? "#006f94" : "#65d8ff";
+    context.strokeStyle = "#65d8ff";
     context.lineWidth = 2;
     context.beginPath();
     values.forEach((value, index) => {
@@ -1487,56 +1846,104 @@
       else context.lineTo(x, y);
     });
     context.stroke();
+    drawDensityProgress(state.pausedAt);
+  }
+
+  function drawDensityProgress(time) {
+    const chart = state.chart;
+    if (!chart) return;
+    const canvas = ui.densityGraph;
+    const context = canvas.getContext("2d");
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    const width = Math.max(1, Math.round(canvas.clientWidth));
+    const height = Math.max(1, Math.round(canvas.clientHeight));
+    const x = Math.max(1, Math.min(width - 1, time / Math.max(0.001, chart.duration) * width));
+    context.save();
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.strokeStyle = currentDifficultyStyle()[1];
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+    context.fillStyle = currentDifficultyStyle()[1];
+    context.beginPath();
+    context.moveTo(x - 4, 0);
+    context.lineTo(x + 4, 0);
+    context.lineTo(x, 6);
+    context.closePath();
+    context.fill();
+    context.restore();
   }
 
   function renderNotesRadar(values) {
     const canvas = ui.notesRadar;
+    const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+    const cssWidth = Math.max(1, Math.round(canvas.clientWidth));
+    const cssHeight = Math.max(1, Math.round(canvas.clientHeight));
+    const backingWidth = Math.round(cssWidth * pixelRatio);
+    const backingHeight = Math.round(cssHeight * pixelRatio);
+    if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+      canvas.width = backingWidth;
+      canvas.height = backingHeight;
+    }
     const context = canvas.getContext("2d");
-    const width = canvas.width;
-    const height = canvas.height;
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    const width = cssWidth;
+    const height = cssHeight;
     const centerX = width / 2;
-    const centerY = height / 2 + 4;
-    const radius = Math.min(width * 0.31, height * 0.34);
+    const centerY = height / 2 + 2;
+    const maximumRadius = Math.min(width * 0.4, height * 0.4);
+    const radius100 = maximumRadius * 0.68;
     const labels = ["NOTES", "PEAK", "SCRATCH", "SOF-LAN", "CHARGE", "CHORD"];
     const colors = ["#f064cf", "#f6d64a", "#ff7c58", "#6d7cff", "#49d8df", "#b7e65c"];
-    const point = (axis, scale = 1) => {
+    const levelColor = currentDifficultyStyle()[1];
+    const point = (axis, value = 100) => {
       const angle = -Math.PI / 2 + axis * Math.PI / 3;
-      return [centerX + Math.cos(angle) * radius * scale, centerY + Math.sin(angle) * radius * scale];
+      const normalized = Math.max(0, Math.min(200, value));
+      const distance = normalized <= 100
+        ? radius100 * normalized / 100
+        : radius100 + (maximumRadius - radius100) * (normalized - 100) / 100;
+      return [centerX + Math.cos(angle) * distance, centerY + Math.sin(angle) * distance];
     };
 
-    context.clearRect(0, 0, width, height);
-    context.fillStyle = state.theme === "light" ? "#aeb8bf" : "#0d1014";
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#0d1014";
     context.fillRect(0, 0, width, height);
     for (let ring = 1; ring <= 4; ring++) {
       context.beginPath();
       for (let axis = 0; axis < 6; axis++) {
-        const [x, y] = point(axis, ring / 4);
+        const [x, y] = point(axis, ring * 25);
         if (axis === 0) context.moveTo(x, y);
         else context.lineTo(x, y);
       }
       context.closePath();
-      context.strokeStyle = state.theme === "light" ? "rgba(44,57,66,.35)" : "rgba(185,205,216,.25)";
-      context.lineWidth = 1;
+      context.strokeStyle = "rgba(185,205,216,.25)";
+      context.lineWidth = ring === 4 ? 2 : 1;
       context.stroke();
     }
     for (let axis = 0; axis < 6; axis++) {
-      const [x, y] = point(axis);
+      const [x, y] = point(axis, 200);
       context.beginPath();
       context.moveTo(centerX, centerY);
       context.lineTo(x, y);
+      context.strokeStyle = "rgba(185,205,216,.25)";
+      context.lineWidth = 1;
       context.stroke();
     }
 
     context.beginPath();
     values.forEach((value, axis) => {
-      const [x, y] = point(axis, Math.max(0.06, value));
+      const [x, y] = point(axis, Math.max(4, Math.min(200, value)));
       if (axis === 0) context.moveTo(x, y);
       else context.lineTo(x, y);
     });
     context.closePath();
-    context.fillStyle = "rgba(217, 202, 31, .68)";
+    context.globalAlpha = 0.48;
+    context.fillStyle = levelColor;
     context.fill();
-    context.strokeStyle = "#fff46a";
+    context.globalAlpha = 1;
+    context.strokeStyle = levelColor;
     context.lineWidth = 2;
     context.stroke();
 
@@ -1544,10 +1951,26 @@
     context.textAlign = "center";
     context.textBaseline = "middle";
     labels.forEach((label, axis) => {
-      const [x, y] = point(axis, 1.22);
+      const angle = -Math.PI / 2 + axis * Math.PI / 3;
+      const labelRadius = maximumRadius + 10;
+      const measured = context.measureText(label);
+      const halfWidth = measured.width / 2;
+      const x = Math.max(
+        halfWidth + 4,
+        Math.min(width - halfWidth - 4, centerX + Math.cos(angle) * labelRadius)
+      );
+      const y = Math.max(
+        10,
+        Math.min(height - 10, centerY + Math.sin(angle) * labelRadius)
+      );
       context.fillStyle = colors[axis];
       context.fillText(label, x, y);
     });
+
+    const [scaleX, scaleY] = point(0, 100);
+    context.font = "600 9px Segoe UI, Arial, sans-serif";
+    context.fillStyle = "#b9cdd8";
+    context.fillText("100", scaleX + 12, scaleY + 3);
   }
 
   function renderMeasureGrid(chart) {
@@ -1559,6 +1982,7 @@
       groups[measure].push(note);
     }
     ui.measureGrid.replaceChildren();
+    state.followedMeasure = -1;
     for (let start = 0; start < measureCount; start += measuresPerColumn) {
       const column = document.createElement("div");
       column.className = "measure-column";
@@ -1573,11 +1997,9 @@
         const number = document.createElement("span");
         number.className = "measure-number";
         number.textContent = String(measure + 1);
-        card.append(canvas, number);
-        card.addEventListener("click", () => {
-          switchView("player");
-          seekTo(chart.beatToSeconds(chart.measureStarts[measure]));
-        });
+        const progress = document.createElement("i");
+        progress.className = "measure-progress";
+        card.append(canvas, progress, number);
         column.append(card);
       }
       ui.measureGrid.append(column);
@@ -1592,19 +2014,26 @@
     const startBeat = chart.measureStarts[measure];
     const endBeat = chart.measureStarts[measure + 1] ?? startBeat + 4;
     const laneWidth = width / chart.lanes;
-    context.fillStyle = state.theme === "light" ? "#9fa9b0" : "#090c0f";
+    context.fillStyle = "#090c0f";
     context.fillRect(0, 0, width, height);
     for (let lane = 0; lane < chart.lanes; lane++) {
-      context.fillStyle = lane === 0 || (chart.lanes === 16 && lane === 15)
-        ? (state.theme === "light" ? "#9b8d79" : "#19140d")
-        : isWhiteKeyLane(lane, chart.lanes)
-          ? (state.theme === "light" ? "#cbd1d5" : "#171a1e")
-          : (state.theme === "light" ? "#8e99a2" : "#0e1115");
+      context.fillStyle = chart.hasScratch !== false && (lane === 0 || (chart.lanes === 16 && lane === 15))
+        ? "#19140d"
+        : isWhiteKeyLane(lane, chart.lanes, chart.hasScratch !== false)
+          ? "#171a1e"
+          : "#0e1115";
       context.fillRect(lane * laneWidth, 0, laneWidth, height);
-      context.strokeStyle = state.theme === "light" ? "#69757d" : "#34404a";
+      context.strokeStyle = "#34404a";
       context.strokeRect(lane * laneWidth, 0, laneWidth, height);
     }
-    context.strokeStyle = state.theme === "light" ? "#7c878f" : "#2e3942";
+    if (chart.lanes === 16) {
+      const centerX = laneWidth * 8;
+      context.fillStyle = "#030506";
+      context.fillRect(centerX - 3, 0, 6, height);
+      context.fillStyle = "#8fa4b0";
+      context.fillRect(centerX - 0.75, 0, 1.5, height);
+    }
+    context.strokeStyle = "#2e3942";
     for (let division = 1; division < 16; division++) {
       const y = height - division / 16 * height;
       context.beginPath();
@@ -1625,24 +2054,45 @@
     for (const note of notes) {
       const lane = laneFor(note, chart.lanes);
       const y = height - (note.beat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
-      const scratch = lane === 0 || (chart.lanes === 16 && lane === 15);
-      context.fillStyle = scratch ? "#ffbf2f" : isWhiteKeyLane(lane, chart.lanes) ? "#f3f5f6" : "#377dff";
+      const scratch = chart.hasScratch !== false && (lane === 0 || (chart.lanes === 16 && lane === 15));
+      const noteColor = scratch ? "#ffbf2f" : isWhiteKeyLane(lane, chart.lanes, chart.hasScratch !== false) ? "#f3f5f6" : "#377dff";
+      context.fillStyle = noteColor;
       if (note.longStart && note.longPair) {
         const pairBeat = Math.min(endBeat, note.longPair.beat);
         const pairY = height - (pairBeat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
-        context.fillStyle = "#31a8ff";
+        context.globalAlpha = 0.62;
+        context.fillStyle = noteColor;
         context.fillRect(lane * laneWidth + laneWidth * 0.25, pairY, laneWidth * 0.5, Math.max(4, y - pairY));
+        context.globalAlpha = 1;
       }
+      context.fillStyle = noteColor;
       context.fillRect(lane * laneWidth + 2, y - 3, Math.max(2, laneWidth - 4), 6);
     }
   }
 
   function updateInspectorCurrent() {
-    if (!state.chart) return;
+    if (!state.chart || state.view !== "inspector") return;
     const beat = state.chart.secondsToBeat(state.pausedAt);
     const measure = Math.max(0, upperBoundValue(state.chart.measureStarts, beat) - 1);
     for (const card of ui.measureGrid.querySelectorAll(".measure-card")) {
-      card.classList.toggle("current", Number(card.dataset.measure) === measure);
+      const current = Number(card.dataset.measure) === measure;
+      card.classList.toggle("current", current);
+      const progress = card.querySelector(".measure-progress");
+      if (progress) {
+        const startBeat = state.chart.measureStarts[measure] ?? 0;
+        const endBeat = state.chart.measureStarts[measure + 1] ?? startBeat + 4;
+        const position = current
+          ? Math.max(0, Math.min(1, (beat - startBeat) / Math.max(0.001, endBeat - startBeat)))
+          : 0;
+        progress.style.display = current ? "block" : "none";
+        progress.style.bottom = `${position * 100}%`;
+      }
+    }
+    renderDensityGraph(state.chart);
+    if (ui.inspectorFollow.checked && state.followedMeasure !== measure) {
+      state.followedMeasure = measure;
+      const current = ui.measureGrid.querySelector(".measure-card.current");
+      current?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
     }
   }
 
@@ -1690,14 +2140,15 @@
     const minimumWidth = (lanes === 16 ? 680 : 460) * widthScale;
     const fieldWidth = Math.min(width - 32, Math.max(minimumWidth, idealWidth));
     const left = (width - fieldWidth) / 2;
-    const geometry = laneGeometry(lanes, fieldWidth, left);
+    const hasScratch = chart?.hasScratch !== false;
+    const geometry = laneGeometry(lanes, fieldWidth, left, hasScratch);
     const judgeY = height - 86;
 
     for (let lane = 0; lane < lanes; lane++) {
       const column = geometry[lane];
       ctx.fillStyle = column.scratch
         ? themeColor("--lane-scratch")
-        : isWhiteKeyLane(lane, lanes)
+        : isWhiteKeyLane(lane, lanes, hasScratch)
           ? themeColor("--lane-white")
           : themeColor("--lane-blue");
       ctx.fillRect(column.x, 0, column.width, height);
@@ -1705,6 +2156,13 @@
       ctx.beginPath(); ctx.moveTo(column.x, 0); ctx.lineTo(column.x, height); ctx.stroke();
     }
     ctx.beginPath(); ctx.moveTo(left + fieldWidth, 0); ctx.lineTo(left + fieldWidth, height); ctx.stroke();
+    if (lanes === 16) {
+      const centerX = geometry[8].x;
+      ctx.fillStyle = "#030506";
+      ctx.fillRect(centerX - 4, 0, 8, height);
+      ctx.fillStyle = "#90a8b5";
+      ctx.fillRect(centerX - 1, 0, 2, height);
+    }
     ctx.strokeStyle = themeColor("--judge-line"); ctx.lineWidth = 3;
     ctx.beginPath(); ctx.moveTo(left, judgeY); ctx.lineTo(left + fieldWidth, judgeY); ctx.stroke();
     ctx.lineWidth = 1;
@@ -1751,15 +2209,18 @@
         const endY = Math.max(0, judgeY - endDistance);
         const bodyX = column.x + Math.max(5, column.width * 0.22);
         const bodyWidth = Math.max(4, column.width - Math.max(10, column.width * 0.44));
-        ctx.fillStyle = themeColor("--ln-body");
-        ctx.fillRect(bodyX, endY, bodyWidth, Math.max(noteThickness, startY - endY));
-        ctx.strokeStyle = themeColor("--ln-edge");
-        ctx.strokeRect(bodyX + .5, endY + .5, bodyWidth - 1, Math.max(noteThickness, startY - endY) - 1);
-        ctx.fillStyle = column.scratch
+        const noteColor = column.scratch
           ? themeColor("--note-scratch")
-          : isWhiteKeyLane(lane, lanes)
+          : isWhiteKeyLane(lane, lanes, hasScratch)
             ? themeColor("--note-white")
             : themeColor("--note-blue");
+        ctx.globalAlpha = 0.62;
+        ctx.fillStyle = noteColor;
+        ctx.fillRect(bodyX, endY, bodyWidth, Math.max(noteThickness, startY - endY));
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = noteColor;
+        ctx.strokeRect(bodyX + .5, endY + .5, bodyWidth - 1, Math.max(noteThickness, startY - endY) - 1);
+        ctx.fillStyle = noteColor;
         ctx.fillRect(column.x + 3, endY - noteThickness / 2, column.width - 6, noteThickness);
         ctx.fillRect(column.x + 3, startY - noteThickness / 2, column.width - 6, noteThickness);
       }
@@ -1779,7 +2240,7 @@
         const y = judgeY - distance;
         ctx.fillStyle = column.scratch
           ? themeColor("--note-scratch")
-          : isWhiteKeyLane(lane, lanes)
+          : isWhiteKeyLane(lane, lanes, hasScratch)
             ? themeColor("--note-white")
             : themeColor("--note-blue");
         ctx.fillRect(column.x + 3, y - noteThickness / 2, column.width - 6, noteThickness);
@@ -1867,22 +2328,11 @@
     return Math.min(maximum, Math.max(minimum, value));
   }
 
-  function setTheme(theme) {
-    state.theme = theme === "light" ? "light" : "dark";
-    document.documentElement.dataset.theme = state.theme;
-    ui.theme.textContent = state.theme === "dark" ? "\u2600" : "\u263e";
-    ui.theme.title = state.theme === "dark" ? "Use light theme" : "Use dark theme";
-    ui.theme.setAttribute("aria-label", ui.theme.title);
-    localStorage.setItem("bms-player-theme", state.theme);
-    refreshPalette();
-    draw(state.pausedAt);
-    renderBgaFrame();
-    if (state.chart && state.view === "inspector") renderInspector();
-  }
-
   function bindControls() {
     ui.open.addEventListener("click", () => ui.folder.click());
+    ui.openOsz.addEventListener("click", () => ui.osz.click());
     ui.folder.addEventListener("change", () => loadFolder(ui.folder.files));
+    ui.osz.addEventListener("change", () => loadOsz(ui.osz.files[0]));
     ui.select.addEventListener("change", () => selectChart(Number(ui.select.value)));
     ui.play.addEventListener("click", () => state.playing ? pause() : play());
     ui.stop.addEventListener("click", stop);
@@ -1894,6 +2344,17 @@
       updateInspectorCurrent();
       const current = ui.measureGrid.querySelector(".measure-card.current");
       current?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    });
+    ui.inspectorFollow.addEventListener("change", () => {
+      state.followedMeasure = -1;
+      if (ui.inspectorFollow.checked) updateInspectorCurrent();
+    });
+    ui.densityGraph.addEventListener("click", async (event) => {
+      if (!state.chart) return;
+      const bounds = ui.densityGraph.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width)));
+      await seekTo(ratio * state.chart.duration);
+      if (!state.playing) await play();
     });
 
     ui.scrollMode.addEventListener("change", updateScrollControls);
@@ -1988,10 +2449,33 @@
     });
     ui.back.addEventListener("click", () => seekTo(state.pausedAt - 10));
     ui.forward.addEventListener("click", () => seekTo(state.pausedAt + 10));
-    ui.theme.addEventListener("click", () => {
-      setTheme(state.theme === "dark" ? "light" : "dark");
-    });
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    document.addEventListener("keydown", async (event) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.repeat) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (
+        target.isContentEditable ||
+        /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(target.tagName)
+      )) return;
+      if (!state.chart) return;
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (state.playing) pause();
+        else await play();
+        return;
+      }
+      if (event.code === "ArrowLeft" || event.code === "ArrowRight") {
+        event.preventDefault();
+        const direction = event.code === "ArrowLeft" ? -1 : 1;
+        await seekTo(state.pausedAt + direction * (event.shiftKey ? 10 : 5));
+        return;
+      }
+      if (event.code === "KeyR") {
+        event.preventDefault();
+        stop();
+      }
+    });
     for (const media of [ui.video, ui.layerVideo]) {
       media.addEventListener("error", () => {
         ui.status.textContent = "A BGA video could not be decoded by this browser.";
@@ -2008,7 +2492,9 @@
     ui.scratchWidthValue.value = "155%";
 
     bindControls();
-    setTheme(localStorage.getItem("bms-player-theme") || "dark");
+    document.documentElement.removeAttribute("data-theme");
+    localStorage.removeItem("bms-player-theme");
+    refreshPalette();
 
     const canvasObserver = new ResizeObserver(() => {
       syncCanvasSize();
