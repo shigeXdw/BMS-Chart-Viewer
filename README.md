@@ -10,13 +10,17 @@ are read locally and never uploaded
 ## Features
 
 - `#BASE 36` and `#BASE 62`
-- 7-key and 14-key charts
-- MP4/WebM BGA
-- Multiple videos within one chart
+- BMSON 1.0 support
+- osu!mania `.osz` archives
+- 7-key and 14-key BMS charts`
+- MP4/M4V (including HEVC when the browser supports it), WebM, OGV, MOV,
+  MPEG, and transport-stream BGA video
+- Classic BMS image-sequence BGA
 - Normal, Mirror, Random, R-Random, and S-Random lane layouts
-- SUDDEN+, IIDX-style Hi-Speed, playback speed, and pitch controls
+- SUDDEN+, beatoraja-style IIDX Hi-Speed with green number, numeric playback
+  speed, and pitch controls
 - KPS, peak KPS, density, and note progress statistics
-
+- Textage-style chart inspector
 ## Limitations
 
 This is an autoplay preview
