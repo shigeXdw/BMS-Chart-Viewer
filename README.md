@@ -1,7 +1,6 @@
-# BMS Player
+# VSRG Player
 
-A dependency-free browser player for previewing BMS, BME and BMSON charts, Song files
-are read locally and never uploaded
+Browser-based BMS/BME/BMSON and osu!mania .osz autoplay chart previewer with keysounds, BGA, lane mods, SUDDEN+, Hi-Speed, and live chart statistics. 
 
 ## Live Player
 
