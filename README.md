@@ -4,7 +4,7 @@ Browser-based BMS/BME/BMSON and osu!mania .osz autoplay chart previewer with key
 
 ## Live Player
 
-[Open BMS Player](https://shigexdw.github.io/BMS-Chart-Viewer/)
+[Open Player](https://shigexdw.github.io/BMS-Chart-Viewer/)
 
 ## Features
 
