@@ -978,11 +978,12 @@
     if (chart.format === "osu") {
       const rating = Number.isFinite(chart.stars) ? chart.stars.toFixed(2) : "--";
       const version = chart.header.OSU_VERSION || chart.name;
-      return `SR ${rating} | ${title} [${version}]`;
+      return `SR ${rating} | ${chart.lanes}K | ${title} [${version}]`;
     }
     const level = chart.header.PLAYLEVEL || "--";
     const difficulty = currentChartDifficultyLabel(chart);
-    return `LV ${level} | ${title}${difficulty ? ` [${difficulty}]` : ""}`;
+    const playSide = chart.lanes === 16 ? "DP" : "SP";
+    return `LV ${level} | ${playSide} | ${title}${difficulty ? ` [${difficulty}]` : ""}`;
   }
 
   function currentChartDifficultyLabel(chart) {
