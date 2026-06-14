@@ -1,6 +1,6 @@
 # VSRG Player
 
-Browser-based BMS/BME/BMSON and osu!mania .osz autoplay chart previewer with keysounds, BGA, lane mods, SUDDEN+, Hi-Speed, and live chart statistics. 
+Browser-based autoplay chart previewer with keysounds, BGA, lane mods, SUDDEN+, Hi-Speed, and live chart statistics. 
 
 ## Live Player
 
