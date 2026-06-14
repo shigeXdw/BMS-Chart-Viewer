@@ -22,10 +22,10 @@
   };
 
   const ui = {
-    open: $("openButton"),
-    openOsz: $("openOszButton"),
+    openFile: $("openFileButton"),
+    openFolder: $("openFolderButton"),
+    files: $("fileInput"),
     folder: $("folderInput"),
-    osz: $("oszInput"),
     select: $("chartSelect"),
     play: $("playButton"),
     stop: $("stopButton"),
@@ -133,6 +133,7 @@
     bgaPreloadPromise: null,
     bgaRenderToken: 0,
     failedAudio: new Set(),
+    missingAudio: new Set(),
     peakKps: 0,
     laneMod: "normal",
     laneMappings: [],
@@ -938,17 +939,16 @@
   }
 
   async function loadCollectedFiles() {
-    const chartFiles = [...state.files.values()].filter((file) => /\.(bms|bme|bmson|osu)$/i.test(file.name));
+    const chartFiles = [...state.files.values()].filter((file) => PlayerModes.find(file));
     for (const file of chartFiles) {
       try {
-        if (/\.osu$/i.test(file.name)) {
-          const bytes = new Uint8Array(await file.arrayBuffer());
-          const chart = await parseOsu(bytes, file.name);
-          if (chart) state.charts.push(chart);
-          continue;
-        }
-        const text = /\.bmson$/i.test(file.name) ? await file.text() : await decodeText(file);
-        state.charts.push(/\.bmson$/i.test(file.name) ? parseBmson(text, file.name) : parseChart(text, file.name));
+        const chart = await PlayerModes.parse(file, {
+          decodeText,
+          parseBms: parseChart,
+          parseBmson,
+          parseOsu
+        });
+        if (chart) state.charts.push(chart);
       } catch (error) {
         console.error(file.name, error);
       }
@@ -974,7 +974,8 @@
   }
 
   function chartSelectLabel(chart) {
-    const title = chart.header.TITLE || chart.name.replace(/\.(bms|bme|bmson|osu)$/i, "");
+    if (chart.mode?.selectLabel) return chart.mode.selectLabel(chart);
+    const title = chart.header.TITLE || chart.name.replace(/\.(bms|bme|bmson|osu|ugc)$/i, "");
     if (chart.format === "osu") {
       const rating = Number.isFinite(chart.stars) ? chart.stars.toFixed(2) : "--";
       const version = chart.header.OSU_VERSION || chart.name;
@@ -997,37 +998,36 @@
     return subartist ? `${artist} · ${subartist}` : artist;
   }
 
-  async function loadFolder(fileList) {
-    resetLoadedContent();
-    for (const file of fileList) {
-      const relative = file.webkitRelativePath || file.name;
-      const parts = relative.split("/");
-      parts.shift();
-      state.files.set(normalizePath(parts.join("/")), file);
-    }
-    await loadCollectedFiles();
+  function addRegularFile(file) {
+    const relative = file.webkitRelativePath || file.name;
+    const parts = relative.split("/");
+    if (parts.length > 1) parts.shift();
+    state.files.set(normalizePath(parts.join("/")), file);
   }
 
-  async function loadOsz(file) {
-    if (!file) return;
-    resetLoadedContent();
-    ui.status.textContent = `Opening ${file.name}...`;
-    try {
-      const archive = fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
-      for (const [path, bytes] of Object.entries(archive)) {
-        if (path.endsWith("/")) continue;
-        const name = path.split("/").pop();
-        state.files.set(normalizePath(path), new File([bytes], name));
-      }
-      await loadCollectedFiles();
-      const skipped = [...state.files.values()].filter((entry) => /\.osu$/i.test(entry.name)).length - state.charts.length;
-      if (skipped > 0) {
-        ui.status.textContent += ` ${skipped} non-mania chart(s) skipped.`;
-      }
-    } catch (error) {
-      console.error(file.name, error);
-      ui.status.textContent = `Could not open ${file.name}.`;
+  async function addOszArchive(file) {
+    const archive = fflate.unzipSync(new Uint8Array(await file.arrayBuffer()));
+    for (const [path, bytes] of Object.entries(archive)) {
+      if (path.endsWith("/")) continue;
+      const name = path.split("/").pop();
+      state.files.set(normalizePath(path), new File([bytes], name));
     }
+  }
+
+  async function loadFiles(fileList) {
+    if (!fileList?.length) return;
+    resetLoadedContent();
+    for (const file of fileList) {
+      ui.status.textContent = `Opening ${file.name}...`;
+      try {
+        if (/\.osz$/i.test(file.name)) await addOszArchive(file);
+        else addRegularFile(file);
+      } catch (error) {
+        console.error(file.name, error);
+        ui.status.textContent = `Could not open ${file.name}.`;
+      }
+    }
+    await loadCollectedFiles();
   }
 
   function selectChart(index) {
@@ -1036,6 +1036,7 @@
     state.buffers.clear();
     state.stretchedBuffers.clear();
     state.failedAudio.clear();
+    state.missingAudio.clear();
     state.hitNotes.clear();
     state.effects = [];
     state.lastTime = 0;
@@ -1046,7 +1047,11 @@
     ui.artist.textContent = chartArtistLabel(c);
     ui.genre.textContent = c.header.GENRE || "BMS";
     ui.difficulty.textContent = c.header.PLAYLEVEL || "--";
-    if (c.format === "osu") {
+    if (c.mode?.difficultyStyle) {
+      const levelStyle = c.mode.difficultyStyle(c);
+      ui.difficulty.dataset.label = levelStyle[0] || "";
+      ui.difficulty.style.setProperty("--level-color", levelStyle[1] || "#d5ff36");
+    } else if (c.format === "osu") {
       ui.difficulty.dataset.label = "";
       ui.difficulty.style.setProperty("--level-color", osuStarColor(c.stars));
     } else {
@@ -1060,6 +1065,15 @@
     updateTempoDisplay(0);
     ui.time.textContent = `00:00 / ${formatTime(c.duration)}`;
     ui.seek.value = "0";
+    const customField = Boolean(c.mode?.drawPlayfield);
+    modButtons.forEach((button) => {
+      button.disabled = customField;
+    });
+    ui.scratchWidth.disabled = customField;
+    ui.scratchWidthValue.disabled = customField;
+    ui.sudden.disabled = customField;
+    ui.suddenAmount.disabled = customField || !state.suddenEnabled;
+    ui.suddenAmountValue.disabled = customField || !state.suddenEnabled;
     applyLaneMod();
     updateNoteCounter(0);
     updateLiveStats(0);
@@ -1093,6 +1107,7 @@
 
   function currentDifficultyStyle() {
     const chart = state.chart;
+    if (chart?.mode?.difficultyStyle) return chart.mode.difficultyStyle(chart);
     if (chart?.format === "osu") return [chart.header.OSU_VERSION || "osu!mania", osuStarColor(chart.stars)];
     const difficulty = Number(chart?.header.DIFFICULTY) || difficultyFromName(chart?.name || "");
     return DIFFICULTIES[difficulty] || ["CHART", "#d5ff36"];
@@ -1153,7 +1168,7 @@
     const path = state.chart.wav.get(object);
     const file = path ? findFile(path, "audio") : null;
     if (!file) {
-      if (path) state.failedAudio.add(path);
+      if (path) state.missingAudio.add(path);
       return null;
     }
     const promise = file.arrayBuffer()
@@ -1246,7 +1261,9 @@
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 
-    if (state.failedAudio.size) {
+    if (state.missingAudio.size) {
+      ui.status.textContent = `Missing audio: ${[...state.missingAudio].join(", ")}. Open the chart together with its media files or select its folder.`;
+    } else if (state.failedAudio.size) {
       ui.status.textContent = `${state.failedAudio.size} audio file(s) could not be decoded by this browser.`;
     } else {
       ui.status.textContent = `${needed.length} audio files loaded. Starting playback.`;
@@ -1355,8 +1372,10 @@
     ui.play.title = "Pause";
     if (offset > 0) resumeActiveBgm(offset, generation);
     scheduleAudioWindow(offset, offset + 8);
-    ui.status.textContent = state.failedAudio.size
-      ? `Playback running with ${state.failedAudio.size} unsupported or missing audio file(s).`
+    ui.status.textContent = state.missingAudio.size
+      ? `Playback running with missing audio: ${[...state.missingAudio].join(", ")}.`
+      : state.failedAudio.size
+        ? `Playback running with ${state.failedAudio.size} unsupported audio file(s).`
       : "Playback running.";
     tick();
   }
@@ -1772,10 +1791,14 @@
     if (!chart) return;
     const analysis = chartAnalysis(chart);
     ui.inspectorTitle.textContent = chart.header.TITLE || chart.name;
-    const modLabel = state.laneMod === "rrandom" ? "R-Random"
-      : state.laneMod === "srandom" ? "S-Random"
-        : state.laneMod[0].toUpperCase() + state.laneMod.slice(1);
-    ui.inspectorSubtitle.textContent = `${chartArtistLabel(chart)} · ${chart.lanes === 16 ? "Double play" : "Single play"} · ${chart.measureStarts.length - 1} measures · ${modLabel}`;
+    if (chart.mode?.inspectorSubtitle) {
+      ui.inspectorSubtitle.textContent = chart.mode.inspectorSubtitle(chart, chartArtistLabel(chart));
+    } else {
+      const modLabel = state.laneMod === "rrandom" ? "R-Random"
+        : state.laneMod === "srandom" ? "S-Random"
+          : state.laneMod[0].toUpperCase() + state.laneMod.slice(1);
+      ui.inspectorSubtitle.textContent = `${chartArtistLabel(chart)} · ${chart.lanes === 16 ? "Double play" : "Single play"} · ${chart.measureStarts.length - 1} measures · ${modLabel}`;
+    }
     ui.analysisNotes.textContent = String(chart.noteCount);
     ui.analysisPeak.textContent = analysis.peak.toFixed(1);
     ui.analysisChord.textContent = String(analysis.maxChord);
@@ -2014,7 +2037,18 @@
     const height = canvas.height;
     const startBeat = chart.measureStarts[measure];
     const endBeat = chart.measureStarts[measure + 1] ?? startBeat + 4;
+    if (chart.mode?.drawMeasure) {
+      chart.mode.drawMeasure({
+        context, chart, measure, notes, width, height, startBeat, endBeat
+      });
+      return;
+    }
     const laneWidth = width / chart.lanes;
+    const plotTop = 3;
+    const plotBottom = height - 3;
+    const plotHeight = plotBottom - plotTop;
+    const beatY = (beat) => plotBottom
+      - (beat - startBeat) / Math.max(0.001, endBeat - startBeat) * plotHeight;
     context.fillStyle = "#090c0f";
     context.fillRect(0, 0, width, height);
     for (let lane = 0; lane < chart.lanes; lane++) {
@@ -2035,8 +2069,8 @@
       context.fillRect(centerX - 0.75, 0, 1.5, height);
     }
     context.strokeStyle = "#2e3942";
-    for (let division = 1; division < 16; division++) {
-      const y = height - division / 16 * height;
+    for (let division = 0; division <= 16; division++) {
+      const y = plotBottom - division / 16 * plotHeight;
       context.beginPath();
       context.moveTo(0, y);
       context.lineTo(width, y);
@@ -2044,7 +2078,7 @@
     }
     const bpmEvents = chart.bpmChanges.filter((event) => event.beat >= startBeat && event.beat < endBeat);
     for (const event of bpmEvents) {
-      const y = height - (event.beat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+      const y = beatY(event.beat);
       context.strokeStyle = "#ff5265";
       context.lineWidth = 3;
       context.beginPath();
@@ -2054,13 +2088,13 @@
     }
     for (const note of notes) {
       const lane = laneFor(note, chart.lanes);
-      const y = height - (note.beat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+      const y = beatY(note.beat);
       const scratch = chart.hasScratch !== false && (lane === 0 || (chart.lanes === 16 && lane === 15));
       const noteColor = scratch ? "#ffbf2f" : isWhiteKeyLane(lane, chart.lanes, chart.hasScratch !== false) ? "#f3f5f6" : "#377dff";
       context.fillStyle = noteColor;
       if (note.longStart && note.longPair) {
         const pairBeat = Math.min(endBeat, note.longPair.beat);
-        const pairY = height - (pairBeat - startBeat) / Math.max(0.001, endBeat - startBeat) * height;
+        const pairY = beatY(pairBeat);
         context.globalAlpha = 0.62;
         context.fillStyle = noteColor;
         context.fillRect(lane * laneWidth + laneWidth * 0.25, pairY, laneWidth * 0.5, Math.max(4, y - pairY));
@@ -2135,6 +2169,19 @@
     ctx.fillStyle = themeColor("--canvas-bg");
     ctx.fillRect(0, 0, width, height);
     const chart = state.chart;
+    if (chart?.mode?.drawPlayfield) {
+      chart.mode.drawPlayfield({
+        context: ctx,
+        chart,
+        time,
+        width,
+        height,
+        speed: ui.scrollMode.value === "iidx"
+          ? Math.max(0.25, hiSpeed())
+          : Math.max(0.25, Number(ui.speed.value) / 400)
+      });
+      return;
+    }
     const lanes = chart?.lanes || 8;
     const widthScale = Number(ui.columnWidth.value) / 100;
     const idealWidth = (lanes === 16 ? height * 1.28 : height * 0.78) * widthScale;
@@ -2330,10 +2377,16 @@
   }
 
   function bindControls() {
-    ui.open.addEventListener("click", () => ui.folder.click());
-    ui.openOsz.addEventListener("click", () => ui.osz.click());
-    ui.folder.addEventListener("change", () => loadFolder(ui.folder.files));
-    ui.osz.addEventListener("change", () => loadOsz(ui.osz.files[0]));
+    ui.openFile.addEventListener("click", () => ui.files.click());
+    ui.openFolder.addEventListener("click", () => ui.folder.click());
+    ui.files.addEventListener("change", async () => {
+      await loadFiles(ui.files.files);
+      ui.files.value = "";
+    });
+    ui.folder.addEventListener("change", async () => {
+      await loadFiles(ui.folder.files);
+      ui.folder.value = "";
+    });
     ui.select.addEventListener("change", () => selectChart(Number(ui.select.value)));
     ui.play.addEventListener("click", () => state.playing ? pause() : play());
     ui.stop.addEventListener("click", stop);

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VSRG Chart Viewer</title>
+  <title>B62 BMS Player</title>
   <link rel="stylesheet" href="styles.css?v=21">
 </head>
 <body>
@@ -20,8 +20,8 @@
       <button class="view-tab" type="button" data-view="inspector" aria-selected="false">Chart Inspector</button>
     </nav>
     <div class="transport">
-      <button id="openButton" class="command">Open folder</button>
-      <button id="openOszButton" class="command">Open OSZ</button>
+      <button id="openFileButton" class="command">Open files</button>
+      <button id="openFolderButton" class="command">Open folder</button>
       <select id="chartSelect" aria-label="Chart" disabled>
         <option>No chart loaded</option>
       </select>
@@ -174,7 +174,7 @@
         </div>
       </section>
 
-      <div id="status" class="status">Choose a song folder containing BMS, BME, or BMSON files.</div>
+      <div id="status" class="status">Choose a song folder containing BMS, BME, BMSON, osu!mania, or UMIGURI UGC files.</div>
     </aside>
   </main>
 
@@ -242,11 +242,15 @@
     </section>
   </main>
 
+  <input id="fileInput" type="file" accept=".bms,.bme,.bmson,.osu,.osz,.ugc,.wav,.wave,.ogg,.oga,.opus,.mp3,.mp2,.m4a,.aac,.flac,.aif,.aiff,.weba,.caf,.mp4,.m4v,.webm,.ogv,.mov,.mpeg,.mpg,.mpe,.ts,.m2ts,.bmp,.png,.jpg,.jpeg,.gif,.webp,application/zip" multiple hidden>
   <input id="folderInput" type="file" webkitdirectory multiple hidden>
-  <input id="oszInput" type="file" accept=".osz,application/zip" hidden>
   <script src="vendor/fflate.min.js"></script>
   <script src="vendor/rosu_pp_wasm.js"></script>
   <script src="vendor/rosu_pp_classic.js"></script>
-  <script src="app.js?v=27"></script>
+  <script src="modes/registry.js?v=1"></script>
+  <script src="modes/bms/index.js?v=1"></script>
+  <script src="modes/osu/index.js?v=1"></script>
+  <script src="modes/umiguri/index.js?v=48"></script>
+  <script src="app.js?v=31"></script>
 </body>
 </html>
