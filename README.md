@@ -12,6 +12,7 @@ Browser-based BMS/BME/BMSON and osu!mania .osz autoplay chart previewer with key
 - BMSON 1.0 support
 - osu!mania `.osz` archives
 - 7-key and 14-key BMS charts`
+- UMIGURI V4, V8 support (wip)
 - MP4/M4V (including HEVC when the browser supports it), WebM, OGV, MOV,
   MPEG, and transport-stream BGA video
 - Classic BMS image-sequence BGA
